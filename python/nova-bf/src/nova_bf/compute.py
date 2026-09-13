@@ -852,9 +852,21 @@ class DenseCorpusBatch:
     than passed as a `transfer` argument so the `transfer(r0, r1, device)`
     surface stays identical across vector_types. See `DenseBatchSlice`."""
 
+    _RING_SIZE = 2
+
     def __init__(self, arr: np.ndarray):
         self.arr = arr
         self.share_gram = False
+        # Configured by `_process_batch_group` only when a CUDA batch has enough
+        # slices to overlap transfer with scoring. Keeping this on the batch
+        # preserves `transfer(r0, r1, device)` as the single observable seam.
+        self._transfer_mode = 0
+        self._pinned_rows = 0
+        self._ring = None
+        self._ring_ready = None
+        self._ring_i = 0
+        self._copy_stream = None
+        self._prefetched = {}
 
     @property
     def exact_fp16(self) -> bool:
@@ -885,6 +897,17 @@ class DenseCorpusBatch:
         orig_rows = np.nonzero(keep)[0]
         return DenseCorpusBatch(self.arr[orig_rows]), orig_rows
 
+    def configure_transfer(self, rows: int, mode: int) -> None:
+        """Configure fixed-size pinned staging for this batch's slice loop.
+
+        `rows` is the resolved batch step, rather than the first slice's row
+        count. Filtered files have different surviving-row counts; allocating
+        from those counts would create an unbounded set of pinned-cache size
+        classes across a run.
+        """
+        self._pinned_rows = rows
+        self._transfer_mode = mode
+
     def transfer(self, r0: int, r1: int, device: str) -> "DenseBatchSlice":
         """Transfer one dense row slice and present it to scoring as float32. 
         
@@ -893,13 +916,81 @@ class DenseCorpusBatch:
         """
         import torch
 
-        Cb = torch.from_numpy(self.arr[r0:r1]).to(device, non_blocking=True)
-        if Cb.dtype is not torch.float32:
-            Cb = Cb.to(torch.float32)
+        ready = None
+        prepared = self._prefetched.pop((r0, r1), None)
+        if prepared is not None:
+            Cb, ready = prepared
+        elif self._transfer_mode:
+            Cb, ready = self._transfer_pinned(r0, r1, device)
+        else:
+            Cb = torch.from_numpy(self.arr[r0:r1]).to(device, non_blocking=True)
+            if Cb.dtype is not torch.float32:
+                Cb = Cb.to(torch.float32)
         assert Cb.dtype is torch.float32, (
             f"dense slices must reach the scoring path as float32, got {Cb.dtype}"
         )
-        return DenseBatchSlice(Cb, self.share_gram, exact_fp16=self.exact_fp16)
+        return DenseBatchSlice(
+            Cb, self.share_gram, exact_fp16=self.exact_fp16, ready=ready
+        )
+
+    def prefetch(self, r0: int, r1: int, device: str) -> None:
+        """Start a pinned copy; `transfer` later publishes its device slice.
+
+        Keeping publication in `transfer` preserves the instrumentation seam:
+        a transfer observer sees the slice immediately before scoring even
+        though its data movement started one slice earlier.
+        """
+        key = (r0, r1)
+        if key in self._prefetched:
+            raise RuntimeError(f"dense slice {key} was prefetched twice")
+        self._prefetched[key] = self._transfer_pinned(r0, r1, device)
+
+    def _transfer_pinned(self, r0: int, r1: int, device: str):
+        """Stage one slice through the fixed two-slot pinned-memory ring."""
+        import torch
+
+        rows = r1 - r0
+        if rows > self._pinned_rows:
+            raise RuntimeError(
+                f"dense transfer slice has {rows} rows, above its configured "
+                f"pinned staging capacity {self._pinned_rows}"
+            )
+        if self._ring is None:
+            dtype = torch.from_numpy(self.arr[:1]).dtype
+            self._ring = [
+                torch.empty(
+                    (self._pinned_rows, self.arr.shape[1]),
+                    dtype=dtype,
+                    pin_memory=True,
+                )
+                for _ in range(self._RING_SIZE)
+            ]
+            self._ring_ready = [None] * self._RING_SIZE
+        if self._copy_stream is None:
+            self._copy_stream = torch.cuda.Stream(device=torch.device(device))
+
+        slot = self._ring_i % self._RING_SIZE
+        self._ring_i += 1
+        # The previous DMA must stop reading this host buffer before it is
+        # refilled. Two slots bound reuse; this event makes reuse safe.
+        previous = self._ring_ready[slot]
+        if previous is not None:
+            previous.synchronize()
+        host = self._ring[slot][:rows]
+        host.copy_(torch.from_numpy(self.arr[r0:r1]))
+
+        with torch.cuda.stream(self._copy_stream):
+            Cb = host.to(device, non_blocking=True)
+            # Widen on the copy stream before publishing readiness. Widening
+            # on the compute stream could race the fp16 H2D operation.
+            if Cb.dtype is not torch.float32:
+                Cb = Cb.to(torch.float32)
+            ready = torch.cuda.Event()
+            ready.record(self._copy_stream)
+        self._ring_ready[slot] = ready
+        _DENSE_TRANSFER_STATS["pinned_slices"] += 1
+        _DENSE_TRANSFER_STATS["copy_stream_slices"] += 1
+        return Cb, ready
 
 
 @dataclass
@@ -932,6 +1023,9 @@ class DenseBatchSlice:
     # Carried from the FILE, not recomputed here: whether the corpus values are
     # exactly fp16-representable.
     exact_fp16: bool = False
+    # Copy-stream completion event. A consumer must wait on it before reading
+    # `Cb`; absent on the pageable path.
+    ready: object = None
     _raw: object = None       # lazy Q @ Cbᵀ — only ever built when share_gram
     _c_norms: object = None   # lazy per-row L2 norms (cosine)
     _c_norms_raw: object = None  # lazy per-row L2 norms, UNCLAMPED (the guards)
@@ -940,6 +1034,14 @@ class DenseBatchSlice:
     @property
     def n_rows(self) -> int:
         return self.Cb.shape[0]
+
+    def wait_on(self, stream) -> None:
+        """Make `stream` wait for this slice and own its device allocation."""
+        if self.ready is not None:
+            stream.wait_event(self.ready)
+            # `Cb` was allocated on the copy stream. Tell the caching allocator
+            # that the compute stream continues to use it after the copy ends.
+            self.Cb.record_stream(stream)
 
     def col_norms(self):
         """Return corpus L2 norms with the `1e-12` normalization clamp.
@@ -1089,6 +1191,32 @@ _SPARSE_SWAP_MAX_DENSE_BYTES = int(
 # be permitted and never applied (no search reaches the pre-top-K path), and the
 # switch alone could not tell those apart.
 _PRUNE_APPLIED = {"count": 0}
+_DENSE_TRANSFER_STATS = {
+    "mode": 2,
+    "pinned_slices": 0,
+    "copy_stream_slices": 0,
+}
+
+
+def _dense_transfer_mode() -> int:
+    """Resolve dense H2D mode: pageable (0) or overlapped (2)."""
+    raw = os.environ.get("NOVA_BF_PINNED", "2")
+    try:
+        mode = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"NOVA_BF_PINNED must be 0 (pageable) or 2 (overlapped), got {raw!r}"
+        ) from exc
+    if mode not in (0, 2):
+        raise ValueError(
+            f"NOVA_BF_PINNED must be 0 (pageable) or 2 (overlapped), got {raw!r}"
+        )
+    return mode
+
+
+def dense_transfer_usage() -> dict:
+    """Return the resolved dense-transfer policy and what actually ran."""
+    return dict(_DENSE_TRANSFER_STATS)
 
 
 def _reset_prune_instrumentation() -> None:
@@ -1096,6 +1224,11 @@ def _reset_prune_instrumentation() -> None:
     _LIVE_STATS.clear()
     twopass.reset()
     _reset_twopass_hints()
+    _DENSE_TRANSFER_STATS.update({
+        "mode": _dense_transfer_mode(),
+        "pinned_slices": 0,
+        "copy_stream_slices": 0,
+    })
 
 
 # Track how many query/slice rows survive pruning, overall and per search.
@@ -2837,6 +2970,41 @@ def _tp_scatter_part(part_key, part_enc, live, dst, height: int):
     return full_key, full_enc, full_live
 
 
+def _run_dense_prefetch(batch, ranges, device, process_slice) -> None:
+    """Transfer each dense slice through the observable seam one slice ahead."""
+    import torch
+
+    compute_stream = torch.cuda.current_stream(torch.device(device))
+    inflight_compute: deque = deque()
+    with profiling.slice_mark("bf_prefetch"):
+        batch.prefetch(*ranges[0], device)
+    for index, (r0, r1) in enumerate(ranges):
+        # Enqueue i+1 before compute for i. Its H2D runs on the batch's copy
+        # stream while the compute stream consumes the current device tensor.
+        if index + 1 < len(ranges):
+            with profiling.slice_mark("bf_prefetch"):
+                batch.prefetch(*ranges[index + 1], device)
+        with profiling.slice_mark("bf_ring_slice"):
+            # Publish through the same seam as the pageable path immediately
+            # before scoring. GPU tests and profiling hooks observe this call.
+            sl = batch.transfer(r0, r1, device)
+            sl.wait_on(compute_stream)
+            process_slice(r0, r1, sl)
+        # DMA completion only permits host-buffer reuse. Device allocations
+        # recorded on the compute stream remain live until scoring finishes.
+        # Bound that backlog to two scored slices plus one prefetched slice.
+        done = torch.cuda.Event()
+        done.record(compute_stream)
+        inflight_compute.append(done)
+        if len(inflight_compute) > 1:
+            with profiling.slice_mark("bf_backpressure"):
+                inflight_compute.popleft().synchronize()
+    # Do not carry a remaining slice's backlog into each subsequent batch.
+    for done in inflight_compute:
+        with profiling.slice_mark("bf_backpressure"):
+            done.synchronize()
+
+
 def _process_batch_group(
     batch, member_idxs: list[int], specs: list[SearchSpec], spec_Q, spec_q_norms,
     spec_top_key, spec_top_enc, spec_thr,
@@ -3135,6 +3303,23 @@ def _process_batch_group(
                     process_slice(r0, r1, sl)
             _flush_all_pending()
             return time.perf_counter() - t0
+
+    dense_transfer_mode = _dense_transfer_mode()
+    use_dense_prefetch = (
+        dense_transfer_mode == 2
+        and isinstance(batch, DenseCorpusBatch)
+        and str(device).startswith("cuda")
+        and len(ranges) > 1
+    )
+    if use_dense_prefetch:
+        # Use the resolved step even for a short/filtered batch. This keeps one
+        # pinned allocation size class across files instead of accumulating a
+        # different cached pinned block for every survivor count.
+        batch.configure_transfer(step, dense_transfer_mode)
+
+        _run_dense_prefetch(batch, ranges, device, process_slice)
+        _flush_all_pending()
+        return time.perf_counter() - t0
 
     if not use_double_buffer:
         for r0, r1 in ranges:
@@ -5574,6 +5759,9 @@ def run_compute(
         "batch_size_by_vector_type": vt_batch_size,
         "multivector_batch_size": mv_batch_size,
         "multivector_query_block": mv_query_block,
+        # Dense H2D policy and actual use: 0 is pageable, 2 uses pinned memory
+        # with one-slice copy-stream overlap.
+        "dense_transfer": dense_transfer_usage(),
         # What actually RAN, not what the kill switches permitted.
         "kernels": run_manifest.kernel_usage(
             _PRUNE_APPLIED["count"],

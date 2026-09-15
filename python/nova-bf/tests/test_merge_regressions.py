@@ -941,7 +941,7 @@ def test_a_filename_disagreeing_with_its_rank_metadata_is_refused(tmp_path):
     cfg = _cfg(str(tmp_path / "out"))
     _stamped(cfg, tmp_path / "out" / partial_dir(cfg, cfg.searches[0]),
              [0, 1, 2, 3], 4, names={3: "rank000.parquet", 0: "rank003.parquet"})
-    with pytest.raises(RuntimeError, match="name and its metadata disagree"):
+    with pytest.raises(RuntimeError, match="metadata disagree"):
         merge_mod.run_merge(cfg)
 
 

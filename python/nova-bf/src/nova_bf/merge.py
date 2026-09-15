@@ -1,23 +1,19 @@
-"""Inter-worker reduce over per-rank top-K partials.
+"""Merge per-rank top-K partials into global per-query top-K results.
 
-Each partial contains the top-K for every query over one worker's disjoint
-corpus slice. Partials are row-aligned by query, so merge streams them into a
-running per-query top-K rather than performing a keyed group-by; `_fold`
-verifies the alignment.
+Each partial covers a disjoint corpus slice and contains row-aligned results
+for the same queries. Partials are folded incrementally into a running top-K,
+with query IDs checked for alignment as they arrive.
 
-The reduce is partial-major: only the running state plus a byte-budgeted window
-of partials is resident at once. This avoids batch-major reads, where Parquet
-may materialize an entire row group from every open partial regardless of the
-requested batch size.
-
-`_topk_merge` is order-independent under the shared `(score, tiebreak)` ranking,
-so partials may be folded as they arrive. Payload shared by all partials is
-taken from the first one.
+The reduce is partial-major and bounds the number of partials in flight to
+overlap I/O with folding while limiting memory use. `_topk_merge` uses the
+shared `(score, tiebreak)` ordering, so fold order does not affect the result.
+Query payload columns are retained from the first partial.
 """
 
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -30,6 +26,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.fs as fs
 import pyarrow.parquet as pq
 
 from tqdm import tqdm
@@ -37,7 +34,7 @@ from tqdm import tqdm
 from nova_bf import manifest as run_manifest
 from nova_bf.config import BruteForceConfig, SearchSpec
 from nova_bf.io import ParquetFile, Store
-from nova_bf.tiebreak import SENTINEL_KEY, build_ordinals
+from nova_bf.tiebreak import SENTINEL_KEY, build_ordinals, _is_oom
 from nova_bf.results import (
     CONFIG_KEY,
     FORCED_KEY,
@@ -56,19 +53,15 @@ from nova_bf.results import (
 
 logger = logging.getLogger(__name__)
 
-# How many partials may be read into memory at once. TWO gives read/fold
-# overlap -- one being folded while the next arrives -- which is the whole
-# point of the window; one makes the merge strictly sequential.
+# How many partials may be read into memory at once.
 _MERGE_WINDOW_DEFAULT = 2
 # Concurrent range GETs per in-flight partial are this divided by the window,
 # because `_ranged_download` builds its own pool PER FILE.
 _RANGED_GET_POOL = 24
-
 def _merge_window(cfg, n_partials: int) -> int:
     """Return the number of partials to keep in flight.
 
-    NOVA_BF_MERGE_WINDOW overrides params.merge_window; invalid values fall
-    back to the config before the default.
+    NOVA_BF_MERGE_WINDOW overrides params.merge_window, then the default.
     """
     assert n_partials >= 1
 
@@ -79,15 +72,15 @@ def _merge_window(cfg, n_partials: int) -> int:
         try:
             want = int(raw)
         except ValueError:
-            want = None
+            pass
 
         if want is not None and want < 1:
             want = None
 
         if want is None:
             logger.warning(
-                "NOVA_BF_MERGE_WINDOW=%r is not a positive integer; using "
-                "params.merge_window instead",
+                "NOVA_BF_MERGE_WINDOW=%r is not a positive integer; "
+                "using params.merge_window",
                 raw,
             )
 
@@ -97,87 +90,101 @@ def _merge_window(cfg, n_partials: int) -> int:
     if not (isinstance(want, int) and not isinstance(want, bool) and want >= 1):
         want = _MERGE_WINDOW_DEFAULT
 
-    # More readers than partials only dilute the shared range-GET pool.
+    # Never keep more readers in flight than there are partials.
     n = min(want, n_partials)
 
     logger.info(
         "merge window: %d partial(s) in flight%s",
         n,
         "" if n == want
-        else f" (requested {want}, clamped to the {n_partials} partial(s) present)",
+        else f" (requested {want}, clamped to {n_partials} partial(s))",
     )
     return n
 
-
 _TARGET_CANDIDATE_SLOTS = 20_000_000
 
+def _resolve_batch_rows(explicit: int | None, n_rows: int, k: int) -> int:
+    """Choose batch rows from the target number of candidate slots.
 
-def _resolve_batch_rows(explicit: int | None, n_rows: int, n_partials: int, k: int) -> int:
-    """Choose merge batch rows from the candidate-memory target.
-
-    Each fold holds `B x 2k` candidates (state + one partial), independent of
-    the total partial count. Explicit batch sizes are honored with a warning
-    when they exceed the automatic target.
+    `2 * k`, NOT `n_partials * k`: a fold holds the running state plus ONE
+    partial, so the candidate grid is `B x 2k` however many partials the merge
+    has. That is why the partial count is not a parameter here -- it only ever
+    appeared in the warning text below.
     """
     per_row = max(1, 2 * k)
     ceiling = max(1, min(_TARGET_CANDIDATE_SLOTS // per_row, n_rows))
+
     if explicit is None:
         return ceiling
+
     want = max(1, min(explicit, n_rows))
     if want > ceiling:
         logger.warning(
-            "params.merge_batch_size=%d holds %.1f M candidate slots per batch "
-            "(2 x k=%d per row; %d partials are folded one at a time), above the "
-            "~%.1f M auto target — honoring it, since you set it. Drop the "
-            "setting to let merge size itself (%d rows) if this OOMs.",
-            explicit, want * per_row / 1e6, k, n_partials,
-            _TARGET_CANDIDATE_SLOTS / 1e6, ceiling,
+            "params.merge_batch_size=%d uses %.1fM candidate slots per fold "
+            "(2 x k=%d per row), above the %.1fM automatic target; using it as "
+            "requested. Drop the setting to let merge size itself (%d rows) if "
+            "this runs out of memory.",
+            explicit,
+            want * per_row / 1e6,
+            k,
+            _TARGET_CANDIDATE_SLOTS / 1e6,
+            ceiling,
         )
+
     return want
 
 
 
-
-def _id_tie_grid(scatter: list, rows: np.ndarray, b: int, width: int) -> np.ndarray:
-    """Lexicographic ID ranks for selected candidate rows.
-
-    Ranks all partials together with `build_ordinals`, matching compute-time
-    tie-breaking and making ranks comparable across shards.
-    """
+def _id_tie_grid(
+    scatter: list,
+    rows: np.ndarray,
+    b: int,
+    width: int,
+) -> np.ndarray:
+    """Build lexicographic ID ranks for selected candidate rows."""
     dest = np.full(b, -1, dtype=np.int64)
     dest[rows] = np.arange(len(rows))
+
     subs, places = [], []
     for row_idx, col, flat_ids in scatter:
         r = dest[row_idx]
         sel = np.flatnonzero(r >= 0)
         if not len(sel):
             continue
-        # Avoid copying when every ID in the partial is selected
-        subs.append(flat_ids if len(sel) == len(flat_ids)
-                    else flat_ids.take(pa.array(sel, pa.int64())))
+
+        # Reuse the full ID array when every candidate is selected.
+        subs.append(
+            flat_ids
+            if len(sel) == len(flat_ids)
+            else flat_ids.take(pa.array(sel, pa.int64()))
+        )
         places.append((r[sel], col[sel]))
 
-    grid = np.full((len(rows), width), np.iinfo(np.int64).max, dtype=np.int64)
+    grid = np.full(
+        (len(rows), width),
+        np.iinfo(np.int64).max,
+        dtype=np.int64,
+    )
     if not subs:
         return grid
+
     try:
         ords = build_ordinals(subs)
     except ValueError as exc:
-        # Null IDs cannot participate in deterministic ID tie-breaking.
         raise ValueError(
-            f"a partial has null hit_ids, which have no ordering position and "
-            f"cannot break a tie ({exc}). Re-run `bf compute` for this search "
-            f"with an id column that has no nulls."
+            "a partial contains null hit_ids, which cannot break ties "
+            "deterministically; re-run `bf compute` with non-null IDs"
         ) from exc
+
     for (r, c), o in zip(places, ords):
         grid[r, c] = o.astype(np.int64)
+
     return grid
 
-# Optional override for the merge fold backend for testing purposes;
-# unset prefers CUDA when available.
+## Optional fold-backend override; defaults to CUDA when available.
 _FOLD_ENV = "NOVA_BF_MERGE_FOLD"
 
-# Which fold(s) actually executed the reduce for the manifest.
+# Fold backends used by the current reduce.
 _FOLD_USED: set[str] = set()
 
 
@@ -186,86 +193,119 @@ def _reset_fold_used() -> None:
 
 
 def _lane_rankable(scatter: list) -> bool:
-    """Whether candidate IDs can use the fixed-width lane ranking path.
-
-    Packed-key folding is worthwhile only when IDs can be ranked as uint64
-    lanes; otherwise ranking falls back to the slower CPU string sort.
-    """
+    """Whether candidate IDs support fixed-width lane ranking."""
     from nova_bf.tiebreak import _fixed_width
 
-    return bool(scatter) and _fixed_width([a for _, _, a in scatter]) is not None
-
+    return bool(scatter) and _fixed_width(
+        [ids for _, _, ids in scatter]
+    ) is not None
 
 def _fold_device(forced_only: bool = False):
     """Return the requested/available fold device, or None for NumPy.
 
-    `forced_only` reports only explicit packed-fold requests.
+    With `forced_only=True`, return whether a non-NumPy backend was explicitly
+    requested.
     """
     want = os.environ.get(_FOLD_ENV, "").strip().lower()
+
     if forced_only:
         return want not in ("", "numpy", "off", "0")
+
     if want in ("numpy", "off", "0"):
         return None
+
     try:
         import torch
     except Exception as exc:
-        # Not just ImportError: a broken CUDA runtime raises OSError out of the
-        # import itself.
+        # Torch import can fail from runtime/library errors, not just ImportError.
         if want:
-            raise RuntimeError(f"{_FOLD_ENV}={want!r} but torch is unusable: {exc}")
+            raise RuntimeError(
+                f"{_FOLD_ENV}={want!r} but torch is unusable: {exc}"
+            ) from exc
         return None
+
     if want in ("torch", "cpu"):
         return torch.device("cpu")
+
     if want == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError(f"{_FOLD_ENV}='cuda' but no CUDA device is available")
+            raise RuntimeError(
+                f"{_FOLD_ENV}='cuda' but no CUDA device is available"
+            )
         return torch.device("cuda")
+
     if want:
-        raise ValueError(f"{_FOLD_ENV}={want!r}; expected cuda, torch, cpu or numpy")
+        raise ValueError(
+            f"{_FOLD_ENV}={want!r}; expected cuda, torch, cpu or numpy"
+        )
+
     dev = os.environ.get("NOVA_BF_DEVICE", "").strip().lower()
     if dev and dev != "cuda":
         return None
+
     return torch.device("cuda") if torch.cuda.is_available() else None
 
+def _fold_torch(
+    scores: np.ndarray,
+    tie: np.ndarray,
+    tie_is_rank: bool,
+    k: int,
+    device,
+) -> np.ndarray:
+    """Return top-k column indices using the packed-key fold."""
+    import torch
 
-def _fold_torch(scores: np.ndarray, tie: np.ndarray, tie_is_rank: bool,
-                k: int, device) -> np.ndarray:
-    """Return top-k column indices using compute's packed-key fold.
+    s = torch.from_numpy(np.ascontiguousarray(scores)).to(device)
+    o = torch.from_numpy(np.ascontiguousarray(tie)).to(device)
 
-    Packed keys order by score, then lower tie rank, so no separate tie-repair
-    pass is needed.
-    """
+    # Compress arbitrary tie values to monotone ranks for packing.
+    if not tie_is_rank:
+        o = _rank_dense(o)
+
+    return _fold_packed(s, o, k).cpu().numpy()
+
+
+def _fold_packed(s, o, k: int):
+    """Return top-k column indices for device-resident score and tie grids."""
     import torch
 
     from nova_bf.compute import _merge_topk
     from nova_bf.tiebreak import pack
 
-    b, width = scores.shape
-    s = torch.from_numpy(np.ascontiguousarray(scores)).to(device)
-    o = torch.from_numpy(np.ascontiguousarray(tie)).to(device)
-    # Compress arbitrary int64 tie keys to monotone 32-bit ranks for packing.
-    if not tie_is_rank:
-        o = _rank_dense(o)
-    
-    # Padding scores already lose; give them any packable ordinal.
+    device = s.device
+    b, width = s.shape
+
+    # Padding already loses by score; any packable ordinal is sufficient.
     o = torch.where(s == float("-inf"), torch.zeros_like(o), o)
     key = pack(s, o)
-    
-    # Match NumPy semantics by forcing NaNs below all valid candidates.
-    if torch.isnan(s).any():
-        key = torch.where(torch.isnan(s),
-                          torch.full_like(key, SENTINEL_KEY), key)
-    enc = (torch.arange(width, device=device, dtype=torch.int64)
-           .expand(b, width).contiguous())
 
-    top_key, top_enc = key[:, :k].contiguous(), enc[:, :k].contiguous()
+    # Match the NumPy path by ranking NaNs below valid candidates.
+    key = torch.where(
+        torch.isnan(s),
+        torch.full_like(key, SENTINEL_KEY),
+        key,
+    )
+
+    enc = (
+        torch.arange(width, device=device, dtype=torch.int64)
+        .expand(b, width)
+        .contiguous()
+    )
+
+    top_key = key[:, :k].contiguous()
+    top_enc = enc[:, :k].contiguous()
+
     if width > k:
         top_key, top_enc = _merge_topk(
-            top_key, top_enc,
-            [(key[:, k:].contiguous(), enc[:, k:].contiguous(), None)], k)
-    # Sort survivors into final score/tiebreak order.
+            top_key,
+            top_enc,
+            [(key[:, k:].contiguous(), enc[:, k:].contiguous(), None)],
+            k,
+        )
+
+    # Return winners in final score/tiebreak order.
     order = torch.argsort(top_key, dim=1, descending=True, stable=True)
-    return top_enc.gather(1, order).cpu().numpy()
+    return top_enc.gather(1, order)
 
 
 def _rank_dense(t):
@@ -355,163 +395,688 @@ def _topk_numpy(scores, ties, scatter, want_tie, b, width, kk):
         top_s[rows] = np.take_along_axis(scores[rows], exact, axis=1)
     return top_idx, top_s
 
+class _LazyIds:
+    """Deferred ID representation for the running merge state.
 
-def _topk_merge(
-    score_lists: list[pa.ListArray],
-    id_lists: list[pa.ListArray],
-    tie_lists: list[pa.ListArray] | None,
-    k: int,
-) -> tuple[pa.ListArray, pa.ListArray, pa.ListArray | None]:
-    """Merge row-aligned per-partial top-K lists into one global top-K.
-
-    Ties are resolved by the SAME rule each worker applied within itself, so the
-    result does not depend on how many workers produced it. 
+    Fixed-width IDs remain as device lanes so later folds can reuse them
+    directly; they are materialized as an Arrow ListArray only when needed.
     """
-    n_partials = len(score_lists)
-    b = len(score_lists[0])
-    width = n_partials * k
-    scores = np.full((b, width), -np.inf, dtype=np.float32)
 
-    # Store indices into Arrow ID buffers instead of materializing Python strings.
-    src = np.full((b, width), -1, dtype=np.int64)
+    __slots__ = ("lanes", "W", "counts", "_arr")
 
-    want_tie = tie_lists is not None
-    ties = np.full((b, width), np.iinfo(np.int64).max, dtype=np.int64) if want_tie else None
-    
-    # Tracks where each partial's IDs land in the candidate grid.
-    scatter: list = []
-    base = 0
+    def __init__(self, lanes, W: int, counts: np.ndarray):
+        self.lanes = lanes    # (sum(counts), nlanes) int64
+        self.W = W            # ID width in bytes
+        self.counts = counts  # per-row hit counts, int32
+        self._arr = None
+
+    @property
+    def dense_k(self) -> int | None:
+        """Return the common row width, or None for ragged rows."""
+        if len(self.counts) and self.counts.min() == self.counts.max():
+            return int(self.counts[0])
+        return None
+
+    def __len__(self) -> int:
+        # Row count, like the `pa.ListArray` this stands in for. Without it a
+        # bare `len(ids)` raises TypeError, and `_validate_fold_inputs`' own
+        # row-count check does exactly that -- so lanes state could not reach
+        # the fold at all. Every other `_LazyIds` check in that function has an
+        # `isinstance` carve-out; this one needs the object to answer instead.
+        return len(self.counts)
+
+    def value_lengths(self):
+        return pa.array(self.counts, pa.int32())
+
+    def materialize(self) -> pa.ListArray:
+        if self._arr is None:
+            off = np.empty(len(self.counts) + 1, dtype=np.int32)
+            off[0] = 0
+            np.cumsum(self.counts, out=off[1:])
+            self._arr = pa.ListArray.from_arrays(
+                pa.array(off, pa.int32()),
+                self._bytes(),
+            )
+            self.lanes = None  # release device representation
+        return self._arr
+
+    def _bytes(self) -> pa.Array:
+        """Materialize IDs from lanes, retrying on the host after a CUDA OOM."""
+        from nova_bf.tiebreak import ids_from_lanes
+
+        try:
+            return ids_from_lanes(self.lanes, self.W)
+        except Exception as exc:  # noqa: BLE001
+            # Host retry only helps when device memory caused the failure.
+            if not _is_oom(exc) or not self.lanes.is_cuda:
+                raise
+
+            logger.warning(
+                "materialising %d rows of ids ran out of device memory (%s); "
+                "retrying on the host",
+                len(self.counts),
+                exc,
+            )
+
+            try:
+                import torch
+
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+
+            return ids_from_lanes(self.lanes.cpu(), self.W)
+
+
+def _as_ids_array(x):
+    """A `pa.ListArray` from either representation."""
+    return x.materialize() if isinstance(x, _LazyIds) else x
+
+def _validate_fold_inputs(score_lists, id_lists, tie_lists, k: int) -> None:
+    """Validate partial structure before either fold backend.
+    """
+    if len(score_lists) != len(id_lists):
+        raise RuntimeError(
+            f"fold received {len(score_lists)} score inputs but "
+            f"{len(id_lists)} ID inputs"
+        )
+
+    if tie_lists is not None and len(tie_lists) != len(score_lists):
+        raise RuntimeError(
+            f"fold received {len(score_lists)} score inputs but "
+            f"{len(tie_lists)} tie inputs"
+        )
+
+    if not score_lists:
+        return
+
+    n_rows = len(score_lists[0])
 
     for w, (sl, il) in enumerate(zip(score_lists, id_lists)):
+        if len(sl) != n_rows or len(il) != n_rows:
+            raise RuntimeError(
+                f"partial {w} has {len(sl)} score rows and {len(il)} ID rows; "
+                f"expected {n_rows}"
+            )
+
         if sl.type.value_type != pa.float32():
             raise RuntimeError(
                 f"partial {w}'s hit_scores are {sl.type.value_type}, not float32; "
-                "merging would round every score into the float32 grid and change "
-                "which candidates tie. Re-run `bf compute` for this search."
+                "re-run `bf compute` for this search."
             )
+
         if sl.null_count:
             raise RuntimeError(
-                f"partial {w}'s hit_scores column has {sl.null_count} null "
-                "row(s); every query must carry a list of hits, empty if it "
-                "matched nothing. Re-run `bf compute` for this search."
+                f"partial {w}'s hit_scores has {sl.null_count} null row(s); "
+                "use empty lists for queries with no hits."
             )
-        lengths = sl.value_lengths().to_numpy(zero_copy_only=False).astype(np.int64)
-        total = int(lengths.sum())
-        if total == 0:
-            continue
-        # Guard against out-of-index access
-        if lengths.max() > k:
+
+        if not isinstance(il, _LazyIds) and il.null_count:
             raise RuntimeError(
-                f"partial {w} has a query with {int(lengths.max())} hits but k={k}; "
-                "a partial must never hold more than k candidates per query. "
-                "Re-run `bf compute` for this search."
+                f"partial {w}'s hit_ids has {il.null_count} null row(s); "
+                "use empty lists for queries with no hits."
             )
-        # Reject null hit values before conversion: null scores become NaN, null ties 
-        # can become INT64_MIN, and null IDs would propagate into the result.
-        flat_s_arr, flat_ids = sl.flatten(), il.flatten()
-        for col_name, child in (("hit_scores", flat_s_arr), ("hit_ids", flat_ids)):
-            if child.null_count:
-                raise RuntimeError(
-                    f"partial {w}'s {col_name} has {child.null_count} null "
-                    "value(s) inside its lists; every hit must carry a real "
-                    f"{col_name[4:]}. Re-run `bf compute` for this search."
-                )
-        flat_s = flat_s_arr.to_numpy(zero_copy_only=False)
-        
-        # Scores and IDs must have identical row structure.
-        id_lengths = il.value_lengths().to_numpy(zero_copy_only=False)
-        if not np.array_equal(id_lengths.astype(np.int64), lengths):
+
+        lengths = (
+            sl.value_lengths()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64)
+        )
+
+        if len(lengths) and lengths.max() > k:
+            raise RuntimeError(
+                f"partial {w} has a query with {int(lengths.max())} hits "
+                f"but k={k}; a partial must never hold more than k candidates "
+                "per query. Re-run `bf compute` for this search."
+            )
+
+        id_lengths = (
+            il.value_lengths()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64)
+        )
+        if not np.array_equal(id_lengths, lengths):
             raise RuntimeError(
                 f"partial {w}'s hit_ids rows are split differently from its "
-                "hit_scores rows; the columns must line up row for row or every "
-                "hit would be reported under the wrong id. Re-run `bf compute` "
-                "for this search."
+                "hit_scores rows; the columns must line up row for row or "
+                "every hit would be reported under the wrong id. Re-run "
+                "`bf compute` for this search."
             )
+
+        children = [("hit_scores", sl.flatten())]
+        if not isinstance(il, _LazyIds):
+            # Lazy state was validated when it was originally folded.
+            children.append(("hit_ids", il.flatten()))
+
+        for name, child in children:
+            if child.null_count:
+                raise RuntimeError(
+                    f"partial {w}'s {name} has {child.null_count} null "
+                    "value(s) inside its lists; every hit must carry a real "
+                    f"{name[4:]}. Re-run `bf compute` for this search."
+                )
+
+        if tie_lists is None:
+            continue
+
+        tl = tie_lists[w]
+        if len(tl) != n_rows:
+            raise RuntimeError(
+                f"partial {w} has {len(tl)} tie rows; expected {n_rows}"
+            )
+        if tl.null_count:
+            raise RuntimeError(
+                f"partial {w}'s hit_tie has {tl.null_count} null row(s); "
+                "use empty lists for queries with no hits."
+            )
+        tie_lengths = (
+            tl.value_lengths()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64)
+        )
+        if not np.array_equal(tie_lengths, lengths):
+            raise RuntimeError(
+                f"partial {w}'s hit_tie rows are split differently from its "
+                "hit_scores rows; the columns must line up row for row or "
+                "ties would be broken against the wrong hits. Re-run "
+                "`bf compute` for this search."
+            )
+        tie_flat = tl.flatten()
+        if tie_flat.null_count:
+            raise RuntimeError(
+                f"partial {w}'s hit_tie has {tie_flat.null_count} null "
+                "value(s) inside its lists; a null has no ordering position "
+                "and would outrank every real hit. Re-run `bf compute` for "
+                "this search."
+            )
+
+
+def _dense_device_fold(score_lists, id_lists, k, device):
+    """Fast fold for dense, fixed-width IDs without a host candidate grid.
+
+    Returns None when the batch does not qualify. `sel` and `scatter` are
+    returned only when every input still uses Arrow IDs.
+    """
+    import torch
+
+    from nova_bf.tiebreak import (
+        _NO_GPU_ORDINALS,
+        _fixed_width,
+        _lanes_on_device,
+        _gpu_perm_from_lanes,
+    )
+
+    # This path bypasses build_ordinals, so honor its GPU-ranking kill switch.
+    if os.environ.get(_NO_GPU_ORDINALS):
+        return None
+
+    n_inputs = len(score_lists)
+    b = len(score_lists[0])
+    width = n_inputs * k
+
+    flat_scores, lane_parts, arrow_ids = [], [], []
+    for sl, il in zip(score_lists, id_lists):
+        lengths = sl.value_lengths().to_numpy(zero_copy_only=False)
+        if len(lengths) != b or lengths.min() != k or lengths.max() != k:
+            return None
+
+        flat_scores.append(sl.flatten())
+
+        if isinstance(il, _LazyIds):
+            if il.dense_k != k or il.lanes is None:
+                return None
+            lane_parts.append(il.lanes)
+            arrow_ids.append(None)
+        else:
+            lane_parts.append(None)
+            arrow_ids.append(il.flatten())
+
+    # Every input must use the same fixed ID width.
+    widths = {il.W for il in id_lists if isinstance(il, _LazyIds)}
+    present = [ids for ids in arrow_ids if ids is not None]
+    if present:
+        W = _fixed_width(present)
+        if W is None:
+            return None
+        widths.add(W)
+
+    if len(widths) != 1:
+        return None
+
+    W = widths.pop()
+    nlanes = (W + 7) // 8
+
+    scores = torch.cat(
+        [
+            torch.from_numpy(
+                np.ascontiguousarray(a.to_numpy(zero_copy_only=False))
+            ).to(device).view(b, k)
+            for a in flat_scores
+        ],
+        dim=1,
+    )
+
+    lanes = torch.cat(
+        [
+            lp if lp is not None
+            else _lanes_on_device([ids], W, b * k, device)
+            for lp, ids in zip(lane_parts, arrow_ids)
+        ],
+        dim=0,
+    )
+
+    total = n_inputs * b * k
+    perm = torch.from_numpy(_gpu_perm_from_lanes(lanes)).to(device)
+
+    ordinals = torch.empty(total, dtype=torch.int64, device=device)
+    ordinals[perm.long()] = torch.arange(
+        total, dtype=torch.int64, device=device
+    )
+    del perm
+
+    # Map input-major ordinals into the row-major candidate grid.
+    tie = (
+        ordinals.view(n_inputs, b, k)
+        .permute(1, 0, 2)
+        .reshape(b, width)
+    )
+    del ordinals
+
+    top_idx = _fold_packed(scores, tie, k)
+    del tie
+
+    top_scores = scores.gather(1, top_idx)
+    del scores
+
+    # Keep winning ID lanes on-device for the next fold.
+    lanes_win = (
+        lanes.view(n_inputs, b, k, nlanes)
+        .permute(1, 0, 2, 3)
+        .reshape(b, width, nlanes)
+        .gather(1, top_idx.unsqueeze(-1).expand(b, k, nlanes))
+        .reshape(b * k, nlanes)
+    )
+    del lanes
+
+    # Arrow gathering is only needed when every input still has Arrow IDs.
+    if all(ids is not None for ids in arrow_ids):
+        src = (
+            torch.arange(total, dtype=torch.int64, device=device)
+            .view(n_inputs, b, k)
+            .permute(1, 0, 2)
+            .reshape(b, width)
+        )
+        sel = src.gather(1, top_idx).cpu().numpy()
+        scatter = [(None, None, ids) for ids in arrow_ids]
+    else:
+        sel, scatter = None, None
+
+    return top_scores.cpu().numpy(), sel, scatter, (lanes_win, W)
+
+
+def _topk_merge(
+    score_lists: list[pa.ListArray],
+    id_lists: list[pa.ListArray | _LazyIds],
+    tie_lists: list[pa.ListArray] | None,
+    k: int,
+    lanes_mode: bool = False,
+) -> tuple[pa.ListArray | _LazyIds, pa.ListArray, pa.ListArray | None]:
+    """Merge row-aligned candidate lists into a per-query top-K."""
+    if not score_lists:
+        raise ValueError("fold requires at least one score input")
+
+    # Validate once before either fold backend.
+    _validate_fold_inputs(score_lists, id_lists, tie_lists, k)
+
+    n_inputs = len(score_lists)
+    b = len(score_lists[0])
+    width = n_inputs * k
+
+    # Dense fixed-width IDs can avoid building the host candidate grid.
+    fast = None
+    dev = None
+    if tie_lists is None and b:
+        dev = _fold_device()
+        if dev is not None:
+            try:
+                fast = _dense_device_fold(score_lists, id_lists, k, dev)
+            except Exception as exc:  # noqa: BLE001
+                if not _is_oom(exc):
+                    raise
+
+                logger.warning(
+                    "merge fold on %s ran out of memory (%s); "
+                    "falling back to the host path",
+                    dev,
+                    exc,
+                )
+
+                if dev.type == "cuda":
+                    try:
+                        import torch
+
+                        torch.cuda.empty_cache()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    if fast is not None:
+        _FOLD_USED.add(f"torch:{dev.type}")
+
+        top_s, sel_all, scatter, lanes_w = fast
+        valid = top_s > -np.inf
+
+        return _assemble(
+            top_s,
+            sel_all,
+            valid,
+            scatter,
+            b,
+            None,
+            None,
+            lanes_win=lanes_w if lanes_mode else None,
+            # Materialize lanes now if no Arrow IDs remain.
+            lanes_fallback=(
+                None if lanes_mode or scatter is not None else lanes_w
+            ),
+        )
+
+    # The general path requires Arrow IDs.
+    id_lists = [_as_ids_array(x) for x in id_lists]
+
+    scores = np.full((b, width), -np.inf, dtype=np.float32)
+    src = np.full((b, width), -1, dtype=np.int64)
+
+    want_tie = tie_lists is not None
+    ties = (
+        np.full(
+            (b, width),
+            np.iinfo(np.int64).max,
+            dtype=np.int64,
+        )
+        if want_tie
+        else None
+    )
+
+    scatter: list = []
+    base = 0
+
+    # Input structure was validated above.
+    for w, (sl, il) in enumerate(zip(score_lists, id_lists)):
+        lengths = (
+            sl.value_lengths()
+            .to_numpy(zero_copy_only=False)
+            .astype(np.int64)
+        )
+        total = int(lengths.sum())
+
+        if total == 0:
+            continue
+
+        flat_s = sl.flatten().to_numpy(zero_copy_only=False)
+        flat_ids = il.flatten()
+
         row_idx = np.repeat(np.arange(b), lengths)
+
         starts = np.zeros(b, dtype=np.int64)
         np.cumsum(lengths[:-1], out=starts[1:])
-        within = np.arange(total) - np.repeat(starts, lengths)  # position within each row
+        within = np.arange(total) - np.repeat(starts, lengths)
+
         col = w * k + within
         scores[row_idx, col] = flat_s
-        # `flat_ids` is in scatter order, so slot j of this partial is element
-        # `base + j` of the partials concatenated end to end.
+
+        # `src` indexes the concatenated ID arrays stored in `scatter`.
         src[row_idx, col] = base + np.arange(total, dtype=np.int64)
         base += total
         scatter.append((row_idx, col, flat_ids))
+
         if want_tie:
-            tl = tie_lists[w]
-            tie_lengths = tl.value_lengths().to_numpy(zero_copy_only=False)
-            # Tie values must align with the same candidates.
-            if not np.array_equal(tie_lengths.astype(np.int64), lengths):
-                raise RuntimeError(
-                    f"partial {w}'s hit_tie rows are split differently from its "
-                    "hit_scores rows; the columns must line up row for row or ties "
-                    "would be broken against the wrong hits. Re-run `bf compute` "
-                    "for this search."
-                )
-            tl_flat = tl.flatten()
-            if tl_flat.null_count:
-                raise RuntimeError(
-                    f"partial {w}'s hit_tie has {tl_flat.null_count} null "
-                    "value(s) inside its lists; a null has no ordering position "
-                    "and would outrank every real hit. Re-run `bf compute` for "
-                    "this search."
-                )
-            ties[row_idx, col] = tl_flat.to_numpy(zero_copy_only=False)
+            ties[row_idx, col] = (
+                tie_lists[w]
+                .flatten()
+                .to_numpy(zero_copy_only=False)
+            )
 
-    kk = min(k, width)
     device = _fold_device()
-    if (device is not None and not want_tie and not _fold_device(forced_only=True)
-            and not _lane_rankable(scatter)):
-        # Avoid ranking every variable-width ID unless explicitly requested.
+    if (
+        device is not None
+        and not want_tie
+        and not _fold_device(forced_only=True)
+        and not _lane_rankable(scatter)
+    ):
+        # Avoid Torch ranking for variable-width IDs unless explicitly requested.
         device = None
-    _FOLD_USED.add("numpy" if device is None else f"torch:{device.type}")
+
+    _FOLD_USED.add(
+        "numpy" if device is None else f"torch:{device.type}"
+    )
+
     if device is not None:
-        tie = ties if want_tie else _id_tie_grid(scatter, np.arange(b), b, width)
-        top_idx = _fold_torch(scores, tie, not want_tie, kk, device)
-        top_s = np.take_along_axis(scores, top_idx, axis=1)
+        tie = (
+            ties
+            if want_tie
+            else _id_tie_grid(
+                scatter,
+                np.arange(b),
+                b,
+                width,
+            )
+        )
+        top_idx = _fold_torch(
+            scores,
+            tie,
+            not want_tie,
+            k,
+            device,
+        )
+        top_s = np.take_along_axis(
+            scores,
+            top_idx,
+            axis=1,
+        )
     else:
-        top_idx, top_s = _topk_numpy(scores, ties, scatter, want_tie, b, width, kk)
+        top_idx, top_s = _topk_numpy(
+            scores,
+            ties,
+            scatter,
+            want_tie,
+            b,
+            width,
+            k,
+        )
 
-
-    # Drop -inf padding; +inf remains a valid hit.
+    # Drop -inf padding; +inf remains a valid score.
     valid = top_s > -np.inf
-    
-    # ListArray offsets are int32, so guard against silent overflow.
+    sel = np.take_along_axis(
+        src,
+        top_idx,
+        axis=1,
+    )
+
+    top_tie = (
+        np.take_along_axis(
+            ties,
+            top_idx,
+            axis=1,
+        )
+        if want_tie
+        else None
+    )
+
+    out = _assemble(
+        top_s,
+        sel,
+        valid,
+        scatter,
+        b,
+        top_tie,
+        want_tie,
+    )
+
+    if lanes_mode and not isinstance(out[0], _LazyIds):
+        # Keep the running state in lane form when possible.
+        try:
+            out = (
+                _lazy_from_arrow(out[0]),
+                out[1],
+                out[2],
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not _is_oom(exc):
+                raise
+
+            logger.warning(
+                "re-encoding winners as device lanes ran out of memory (%s); "
+                "keeping Arrow IDs",
+                exc,
+            )
+
+    return out
+
+
+def _lazy_from_arrow(ids_arr: pa.ListArray) -> pa.ListArray | _LazyIds:
+    """Re-encode an Arrow id list as device lanes, preserving row lengths.
+
+    Returns the ARGUMENT UNCHANGED when the ids have no common width to pack
+    into -- an all-empty batch has none to measure. Callers take either form
+    (`_as_ids_array` accepts both), which is why this can decline rather than
+    raise.
+    """
+    from nova_bf.tiebreak import _fixed_width, _lanes_on_device
+
+    flat = ids_arr.flatten()
+    W = _fixed_width([flat])
+    if W is None:
+        return ids_arr
+
+    # Only import once needed
+    import torch
+
+    counts = ids_arr.value_lengths().to_numpy(zero_copy_only=False).astype(np.int32)
+    dev = _fold_device() or torch.device("cpu")
+    return _LazyIds(_lanes_on_device([flat], W, len(flat), dev), W, counts)
+
+def _assemble(
+    top_s,
+    sel,
+    valid,
+    scatter,
+    b,
+    top_tie,
+    want_tie,
+    lanes_win=None,
+    lanes_fallback=None,
+):
+    """Assemble winning IDs, scores, and optional ties."""
     counts = valid.sum(axis=1).astype(np.int64)
     total_hits = int(counts.sum())
+
+    # Arrow ListArray offsets are int32.
     if total_hits > np.iinfo(np.int32).max:
         raise ValueError(
             f"{total_hits:,} hits in one merge batch overflows the int32 "
             f"ListArray offsets (limit {np.iinfo(np.int32).max:,})."
         )
+
     counts = counts.astype(np.int32)
     offsets = np.empty(b + 1, dtype=np.int32)
     offsets[0] = 0
     np.cumsum(counts, out=offsets[1:])
     off = pa.array(offsets, pa.int32())
-    scores_arr = pa.ListArray.from_arrays(off, pa.array(top_s[valid], pa.float32()))
-    
-    # Gather only winning IDs from the original Arrow buffers.
-    sel = np.take_along_axis(src, top_idx, axis=1)[valid]
-    ids_arr = pa.ListArray.from_arrays(off, _take_ids(scatter, sel))
-    
+
+    scores_arr = pa.ListArray.from_arrays(
+        off,
+        pa.array(top_s[valid], pa.float32()),
+    )
+
+    if lanes_win is not None or lanes_fallback is not None:
+        lanes, W = (
+            lanes_win
+            if lanes_win is not None
+            else lanes_fallback
+        )
+
+        # Row-major both sides: `lanes` is (b*k, nlanes) over (b, k), the same
+        # order `top_s[valid]` yields. Reorder either and ids attach to the
+        # wrong scores, silently.
+        keep = valid.ravel()
+        if not keep.all():
+            import torch
+
+            idx = torch.from_numpy(np.flatnonzero(keep)).to(lanes.device)
+            lanes = lanes[idx]
+
+        lazy = _LazyIds(lanes, W, counts)
+        ids_arr = (
+            lazy
+            if lanes_win is not None
+            else lazy.materialize()
+        )
+    else:
+        ids_arr = pa.ListArray.from_arrays(
+            off,
+            _take_ids(scatter, sel[valid]),
+        )
+
     ties_arr = None
     if want_tie:
-        # Keep ties aligned with the same winners as scores and IDs.
-        top_tie = np.take_along_axis(ties, top_idx, axis=1)
         ties_arr = pa.ListArray.from_arrays(
-            off, pa.array(top_tie[valid], pa.int64()))
-    return ids_arr, scores_arr, ties_arr
+            off,
+            pa.array(top_tie[valid], pa.int64()),
+        )
 
-def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
+    return ids_arr, scores_arr, ties_arr
+def preflight_searches(cfg: BruteForceConfig) -> None:
+    """Check run-wide merge conditions using listings only.
+
+    `run_merge` repeats these checks per search; this avoids duplicate failures
+    when searches are merged concurrently.
+    """
+    out = Store(cfg.output.path)
+    forced = merge_forced(cfg)
+
+    counts: dict[str, int] = {}
+    for spec in cfg.searches:
+        counts[spec.name] = len(
+            out.list_parquets(subpath=partial_dir(cfg, spec))
+        )
+
+    missing = sorted(
+        name for name, count in counts.items()
+        if count == 0
+    )
+    if missing:
+        raise RuntimeError(
+            f"no partial results for search(es) {missing} under "
+            f"{cfg.output.path} — run `bf compute --num-jobs N` first"
+        )
+
+    if len(counts) > 1 and len(set(counts.values())) > 1:
+        _refuse(
+            forced,
+            "<all>",
+            f"searches have mismatched partial counts: {counts} — every search "
+            "in one `compute` run should have the same number of per-rank "
+            "partials; this points to a rank that died before writing all "
+            "search outputs. Re-run the missing rank(s) with "
+            "`bf compute --num-jobs N --job-rank R` before merging.",
+        )
+
+def run_merge(cfg: BruteForceConfig, only: set[str] | None = None) -> dict[str, str]:
     """Merge each search's per-rank partials into its final Parquet output.
 
-    `merge_ranged_reads` enables concurrent ranged fetches into memory; nothing
-    is staged to local disk.
+    `only` restricts which searches are reduced, not which are validated, so
+    cross-search consistency checks still see the complete run.
     """
-    # Resolve the force flag ONCE, before any I/O, and thread the boolean from
-    # here.
+    # Validate the requested search names before any storage I/O.
+    if only is not None:
+        unknown = only - {s.name for s in cfg.searches}
+        if unknown:
+            raise RuntimeError(
+                f"--search named {sorted(unknown)}, which this config does not "
+                f"define; it has {sorted(s.name for s in cfg.searches)}"
+            )
+
+    # Resolve force once and use the same decision throughout the merge.
     forced = merge_forced(cfg)
     if forced:
         logger.error(
@@ -537,11 +1102,13 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
             )
         partials_by_name[spec.name] = partials
 
-    # All searches from one compute run must have the same rank count.
+    # All searches from one compute run must have the same partial count.
     if len(partials_by_name) > 1:
         counts = {name: len(partials) for name, partials in partials_by_name.items()}
         if len(set(counts.values())) > 1:
-            _refuse(forced, "<all>",
+            _refuse(
+                forced,
+                "<all>",
                 f"searches have mismatched partial counts: {counts} — every search in "
                 "one `compute` run should have the same number of per-rank partials; "
                 "this points to a rank that died partway through writing its per-search "
@@ -549,20 +1116,16 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
                 "`bf compute --num-jobs N --job-rank R` before merging."
             )
 
-    # Run fingerprints are search-specific, so they cannot prove cross-search
-    # consistency. Record the run-global tie-break rule to catch incompatible partials.
-    started_at = datetime.now(timezone.utc)
-    t0 = time.perf_counter()
-    
-    # These readers provide schema/metadata only; `_reduce` streams data through
-    # its own bounded read window.
+    # Readers provide metadata here; `_reduce` streams the actual data.
     readers_by_name: dict[str, list[pq.ParquetFile]] = {
-        spec.name: [pq.ParquetFile(f.read_path, filesystem=out.fs)
-                    for f in partials_by_name[spec.name]]
+        spec.name: [
+            pq.ParquetFile(f.read_path, filesystem=out.fs)
+            for f in partials_by_name[spec.name]
+        ]
         for spec in cfg.searches
     }
-    # Search fingerprints are not comparable across searches, so use the stamped
-    # run-global tie-break rule to reject incompatible partials.
+
+    # Search fingerprints differ, so compare the run-global tie-break rule.
     rules = {
         name: {(r.schema_arrow.metadata or {}).get(TIEBREAK_KEY) for r in readers}
         for name, readers in readers_by_name.items()
@@ -570,35 +1133,179 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
     seen = {v for vs in rules.values() for v in vs if v is not None}
     if len(seen) > 1:
         pretty = {n: sorted(x.decode() for x in v if x) for n, v in rules.items()}
-        _refuse(forced, "<all>",
+        _refuse(
+            forced,
+            "<all>",
             f"partials were computed under different tie-break rules: {pretty} — "
             "merging them puts hits decided by different rules in one artifact. "
             "Re-run `bf compute` so every search uses one `params.tiebreak`."
         )
 
-    entries = [
-        _reduce(cfg, spec, out, partials_by_name[spec.name],
-                readers_by_name[spec.name], forced)
-        for spec in cfg.searches
-    ]
-    # `forced` covers THIS merge
-    any_forced = forced or any(e.get("merge_forced") for e in entries)
+    todo = [s for s in cfg.searches if only is None or s.name in only]
 
-    # Record the completed reduce and the number of partials actually folded.
-    doc = run_manifest.base_manifest(cfg, "merge")
-    doc.update({
-        "started_at": started_at.isoformat(),
-        "searches": entries,
-        "counts": {
-            "partials_merged": sum(e["partials"] for e in entries),
-            "queries": max((e["queries"] for e in entries), default=0),
-        },
-        "timing": {"elapsed_seconds": round(time.perf_counter() - t0, 2)},
-        **({"merge_forced": True} if any_forced else {}),
-        "output_files": [e["output_file"] for e in entries],
-    })
-    run_manifest.write(out, run_manifest.manifest_name(cfg, "merge"), doc)
+    # Use one per-search manifest layout and write each manifest with its output.
+    base = run_manifest.base_manifest(cfg, "merge")
+    entries = []
+    for spec in todo:
+        t_search = time.perf_counter()
+        started_search = datetime.now(timezone.utc)
+
+        e = _reduce(
+            cfg,
+            spec,
+            out,
+            partials_by_name[spec.name],
+            readers_by_name[spec.name],
+            forced,
+        )
+        entries.append(e)
+
+        run_manifest.write(
+            out,
+            run_manifest.manifest_name(cfg, "merge", search=e["name"]),
+            {
+                **base,
+                # Stamp this search's actual completion time.
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "started_at": started_search.isoformat(),
+                "searches": [e],
+                "counts": {
+                    "partials_merged": e["partials"],
+                    "queries": e["queries"],
+                },
+                "output_files": [e["output_file"]],
+                # Forced status belongs to this search's artifact.
+                **({"merge_forced": True} if e.get("merge_forced") else {}),
+                "timing": {
+                    "elapsed_seconds": round(
+                        time.perf_counter() - t_search, 2
+                    ),
+                    **e["timing"],
+                },
+            },
+        )
+
+    # Retire the legacy run-level manifest only when these outputs cover it.
+    # Fan-out merges handle this once in the parent after all children succeed.
+    drop_legacy_manifest(out, cfg, {e["output_file"] for e in entries})
+
     return {e["name"]: e["output_path"] for e in entries}
+def drop_legacy_manifest(
+    out: Store,
+    cfg: BruteForceConfig,
+    written: set[str],
+) -> None:
+    """Remove the legacy run-level manifest when it no longer covers unique outputs.
+
+    `written` contains exact output filenames, since config changes such as `k`
+    may preserve a search name while producing a different Parquet file.
+    """
+    name = run_manifest.manifest_name(cfg, "merge")
+    root = out.root.rstrip("/")
+
+    try:
+        if out.fs.get_file_info(f"{root}/{name}").type == fs.FileType.NotFound:
+            return
+
+        with out.fs.open_input_stream(f"{root}/{name}") as f:
+            doc = json.loads(f.read())
+
+        orphans = []
+        for entry in doc.get("searches") or []:
+            target = entry.get("output_file")
+
+            if not target or target in written:
+                continue  # This merge rewrote the exact output.
+
+            if (
+                out.fs.get_file_info(f"{root}/{target}").type
+                == fs.FileType.NotFound
+            ):
+                continue  # The recorded output no longer exists.
+
+            # Keep the legacy record unless a per-search manifest covers this
+            # exact output file; search names alone are insufficient.
+            if _manifest_covers(
+                out,
+                cfg,
+                entry.get("name"),
+                target,
+            ):
+                continue
+
+            orphans.append(target)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "could not read %s to check what it still describes (%r); "
+            "leaving it alone",
+            name,
+            exc,
+        )
+        return
+
+    if orphans:
+        logger.info(
+            "keeping the legacy run-level manifest %s: it is still the only "
+            "record for %s, which this merge did not replace",
+            name,
+            ", ".join(sorted(orphans)),
+        )
+        return
+
+    _drop_manifests(
+        out,
+        [name],
+        "merge now records one manifest per search",
+    )
+
+
+def _manifest_covers(out: Store, cfg: BruteForceConfig, name, target: str) -> bool:
+    """Whether `name`'s per-search manifest names `target` among its outputs."""
+    if not name:
+        return False
+    own = run_manifest.manifest_name(cfg, "merge", search=name)
+    path = f"{out.root.rstrip('/')}/{own}"
+    try:
+        if out.fs.get_file_info(path).type == fs.FileType.NotFound:
+            return False
+        with out.fs.open_input_stream(path) as f:
+            return target in (json.loads(f.read()).get("output_files") or [])
+    except Exception:                               # noqa: BLE001
+        return False                    # unreadable: assume it covers nothing
+
+
+def _drop_manifests(out: Store, names: list[str], why: str) -> None:
+    """Delete superseded manifests, ignoring ones already absent."""
+    root = out.root.rstrip("/")
+
+    for name in names:
+        path = f"{root}/{name}"
+        try:
+            if out.fs.get_file_info(path).type == fs.FileType.NotFound:
+                continue
+
+            out.fs.delete_file(path)
+
+        except FileNotFoundError:
+            # Another process may have removed it first.
+            continue
+
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "could not remove the superseded manifest %s (%r); it may "
+                "describe a run that is no longer on disk",
+                name,
+                exc,
+            )
+
+        else:
+            logger.info(
+                "removed the superseded manifest %s: %s",
+                name,
+                why,
+            )
+
 
 # --- recorded escape hatch for merge provenance checks ------------------------
 
@@ -920,7 +1627,7 @@ def _reduce(
             f"{partial_dir(cfg, spec)}/ hold 0 queries, so there is nothing to "
             "merge. Re-run `bf compute` for this search."
         )
-    batch_rows = _resolve_batch_rows(cfg.params.merge_batch_size, n_rows, len(partials), k)
+    batch_rows = _resolve_batch_rows(cfg.params.merge_batch_size, n_rows, k)
     logger.info(
         "search=%r: merging %d partials (%d queries, k=%d) in batches of %d",
         spec.name, len(partials), n_rows, k, batch_rows,
@@ -971,29 +1678,93 @@ def _reduce(
         if cur is None:
             # Seed through the same fold so single- and multi-partial merges have 
             # identical normalization and tie semantics.
-            ids0, sc0, ti0 = _topk_merge([sc], [ids], [ti] if want_tie else None, k)
+            ids0, sc0, ti0 = _topk_merge([sc], [ids], [ti] if want_tie else None,
+                                         k, lanes_mode=lanes_mode)
             state[idx] = (ids0, sc0, ti0)
             return
         c_ids, c_sc, c_ti = cur
+        # `lanes_mode` is fixed for the search (see `_reduce`), so the state
+        # keeps the same id representation on every fold: the next fold ranks
+        # it without re-packing and without an Arrow `Take`, and the strings
+        # are built once, at write time.
         ids2, sc2, ti2 = _topk_merge(
             [c_sc, sc], [c_ids, ids],
-            [c_ti, ti] if want_tie else None, k,
+            [c_ti, ti] if want_tie else None, k, lanes_mode=lanes_mode,
         )
         state[idx] = (ids2, sc2, ti2)
 
     ranged = bool(cfg.params.merge_ranged_reads)
     window_n = _merge_window(cfg, len(partials))
+    # Keep one ID representation for the running state throughout the search:
+    # `lanes_mode` true means `state[bi]` ids are always `_LazyIds`, false means
+    # always a `pa.ListArray`. Deciding per fold would make every path handle
+    # both.
+    lanes_mode = False
+    if not want_tie and _fold_device() is not None:
+        from nova_bf.tiebreak import _NO_GPU_ORDINALS, _fixed_width
+        try:
+            # Stream the full ID column so later short rows cannot be missed,
+            # without materializing the whole column at once: density is a
+            # MINIMUM over rows, so a first batch that happens to be full-k
+            # would call a partial dense when its later rows are short.
+            # Bound the probe by roughly 2M IDs rather than a fixed row count.
+            probe_rows = max(256, min(8192, 2_000_000 // max(1, spec.k)))
+            min_len, n_seen, W = None, 0, None
+            for batch in readers[0].iter_batches(batch_size=probe_rows,
+                                                 columns=["hit_ids"]):
+                col = batch.column("hit_ids")
+                if len(col) == 0:
+                    continue
+                lens = col.value_lengths().to_numpy(zero_copy_only=False)
+                n_seen += len(lens)
+                bmin = int(lens.min())
+                min_len = bmin if min_len is None else min(min_len, bmin)
+                if min_len < spec.k:
+                    break               # already not dense; stop reading
+                # Offsets only (see `_fixed_width`); no character data touched.
+                bw = _fixed_width([col.flatten()])
+                if bw is None or (W is not None and bw != W):
+                    W = None
+                    break
+                W = bw
+            # The device fold requires both full-k rows and fixed-width IDs.
+            # A filtered search has short rows by construction, and enabling
+            # lane state there only pays conversions for a path that cannot run.
+            dense = n_seen > 0 and min_len == spec.k
+            lanes_mode = (dense and W is not None
+                          and not os.environ.get(_NO_GPU_ORDINALS))
+            if not dense:
+                logger.info(
+                    "search=%r: partial rows are not all k=%d hits (min %d), so "
+                    "the device fold cannot apply; keeping ids on Arrow",
+                    spec.name, spec.k, min_len if min_len is not None else 0)
+        except Exception:
+            lanes_mode = False           # unreadable probe: stay on Arrow
+        finally:
+            # Release the final decoded probe batch before the reduce starts;
+            # otherwise it stays bound as a local for the whole reduce.
+            batch = col = lens = None
+    logger.info("merge state ids: %s", "device lanes" if lanes_mode else "arrow")
     inputs_forced = _inputs_forced(readers)
-    # Preserve the original URI scheme and divide ranged-read concurrency across 
-    # all in-flight partials.
-    # FLOOR-divide and never round up: `_ranged_download` builds this pool PER
-    # FILE, so `window_n * per_file` is what is actually outstanding. `max(1,
-    # ...)` alone breached the pool once the window stopped being capped at 16
-    # -- measured 64 concurrent GETs at merge_window=64, each pinning a whole
-    # raw file. Capping the window restores the invariant; asserting it here
-    # keeps the two from drifting apart again.
+    # Divide ranged-read concurrency across in-flight partials. The pool is a
+    # budget, not a ceiling: a window wider than the pool still gives each
+    # reader at least one GET, so `merge_window: 64` really does run 64.
     per_file = max(1, _RANGED_GET_POOL // max(1, window_n))
     src = Store(out.uri, ranged_get=ranged, ranged_get_concurrency=per_file)
+    # Give the first partial extra concurrency because folding cannot begin
+    # until it has arrived. The constraint is GETs per file, not bandwidth.
+    # Invalid overrides fall back to the default pool size.
+    raw_first = os.environ.get("NOVA_BF_FIRST_GETS", "").strip()
+    try:
+        first_gets = int(raw_first) if raw_first else _RANGED_GET_POOL
+        if first_gets < 1:
+            raise ValueError(first_gets)
+    except ValueError:
+        logger.warning("NOVA_BF_FIRST_GETS=%r is not a positive integer; "
+                       "using %d", raw_first, _RANGED_GET_POOL)
+        first_gets = _RANGED_GET_POOL
+    src_first = (Store(out.uri, ranged_get=ranged, ranged_get_concurrency=first_gets)
+                 if ranged and first_gets != per_file else src)
     q: Queue = Queue(maxsize=window_n)
     window = Semaphore(window_n)
 
@@ -1014,7 +1785,8 @@ def _reduce(
             # Every partial supplies query IDs for alignment; payload comes from
             # partial 0 only.
             cols = hit_cols + ["query_id"] + (payload_cols if i == 0 else [])
-            q.put((i, src.read_columns(f.read_path, cols)))
+            reader = src_first if i == 0 else src
+            q.put((i, reader.read_columns(f.read_path, cols)))
         except BaseException as exc:            # noqa: BLE001 - re-raised below
             errors.append(exc)
             q.put((i, None))
@@ -1128,14 +1900,24 @@ def _reduce(
 
     # All partials are folded; write each query batch and release its state
     t_write0 = time.perf_counter()
+    # Did a previous, possibly GOOD, result already exist under this name? It
+    # only decides the WORDING of the failure messages below; what actually
+    # survives a failed merge is settled by whether the commit ran, and the
+    # measurements for that are with the cleanup in the `finally`.
+    try:
+        existed = out.fs.get_file_info(path).type != fs.FileType.NotFound
+    except Exception:
+        existed = False
     sink = out.fs.open_output_stream(path)
     writer: pq.ParquetWriter | None = None
     body_ok = False
     try:
         for bi in range(n_batches):
-            ids_arr, scores_arr, _ = state[bi]
+            ids_state, scores_arr, _ = state[bi]
             base = head[bi]
-            lengths = ids_arr.value_lengths().to_numpy(zero_copy_only=False)
+            lengths = ids_state.value_lengths().to_numpy(zero_copy_only=False)
+            # Materialise the strings ONCE, here, if the state carried lanes.
+            ids_arr = _as_ids_array(ids_state)
             short_count += int((lengths < k).sum())
             cols = {"query_id": _col(base, "query_id")}
             for c in payload_cols:
@@ -1156,34 +1938,77 @@ def _reduce(
         body_ok = True
     finally:
         # Close both resources without masking an error already in flight.
-        close_err: BaseException | None = None
+        # Close the writer and the stream separately: `writer.close()` writes
+        # the Parquet footer, `sink.close()` commits the object-store upload.
+        writer_err: BaseException | None = None
+        sink_err: BaseException | None = None
         try:
             if writer is not None:
                 writer.close()
         except BaseException as exc:                # noqa: BLE001
-            close_err = exc
+            writer_err = exc
         try:
             sink.close()
         except BaseException as exc:                # noqa: BLE001
-            close_err = close_err or exc
+            sink_err = exc
+        close_err = writer_err or sink_err
 
         # A successful body is not enough: writer.close() commits the Parquet footer.
         wrote = body_ok and close_err is None
-        if not wrote:
-            # Never leave a partial result under the canonical output name.
+        # Local streams truncate on open; on S3 the object changes only if the
+        # commit runs, so a failed `sink.close()` leaves a previous result whole.
+        committed = not out.is_s3 or sink_err is None
+        if not wrote and committed:
+            # Remove the incomplete output committed under the final name.
             try:
                 out.fs.delete_file(path)
-                logger.error("search=%r: merge failed; removed the incomplete %s",
-                             spec.name, path)
+                removed = True
+            except FileNotFoundError:
+                removed = True          # nothing to clean up; same end state
             except BaseException as exc:            # noqa: BLE001
+                removed = False
                 logger.error(
                     "search=%r: merge failed AND the incomplete %s could not be "
                     "removed (%r) — DELETE IT BY HAND; it is a truncated result "
                     "under the name a finished one would have",
                     spec.name, path, exc)
-            if close_err is not None:
-                logger.error("search=%r: also failed to close the output: %r",
-                             spec.name, close_err)
+            if removed:
+                logger.error("search=%r: merge failed; removed the incomplete %s",
+                             spec.name, path)
+            else:
+                logger.error(
+                    "search=%r: its manifest has been removed too, so nothing "
+                    "claims %s is a finished result", spec.name, path)
+            # Either way: remove any manifest that would now describe a
+            # missing or incomplete output.
+            _drop_manifests(
+                out, [run_manifest.manifest_name(cfg, "merge", search=spec.name)],
+                "the output it described was removed by a failed merge")
+            if existed:
+                logger.error(
+                    "search=%r: %s HELD A PREVIOUS RESULT and this run "
+                    "overwrote it before failing — it is gone, not stale. "
+                    "Re-run the merge; there is nothing to fall back on.",
+                    spec.name, path)
+        elif not wrote:
+            # S3, and the commit never ran. DO NOT DELETE: there is no object
+            # of ours to remove, and if a previous result is there it is whole.
+            logger.error(
+                "search=%r: merge failed before committing %s (%r). Nothing "
+                "was uploaded under that name by this run%s",
+                spec.name, path, sink_err,
+                (" — the object already there is the PREVIOUS result, intact. "
+                 "Check its modification time before trusting it as the result "
+                 "of THIS run." if existed else "."))
+        if not wrote and close_err is not None:
+            logger.error("search=%r: also failed to close the output: %r",
+                         spec.name, close_err)
+        if writer_err is not None:
+            # Prevent `ParquetWriter.__del__` from retrying a failed close.
+            try:
+                writer.is_open = False
+            except Exception:                       # noqa: BLE001
+                pass
         # Closing/committing the output is part of a successful write.
         if body_ok and close_err is not None:
             raise close_err
@@ -1236,6 +2061,11 @@ def _reduce(
         "run_sha": run_sha,
         "merge_fold": sorted(_FOLD_USED),
         "queries_short_of_k": short_count,
+        # The phase split behind the `merge-bench` line, which used to live only
+        # in the log. The writer adds this search's `elapsed_seconds` around it.
+        "timing": {"io_wait_seconds": round(t_io, 2),
+                   "fold_seconds": round(t_fold, 2),
+                   "write_seconds": round(t_write, 2)},
         "corpus_dtype": carried_dtypes.get("corpus_dtype"),
         "queries_dtype": carried_dtypes.get("queries_dtype"),
         # Only when true, so a clean merge's manifest says nothing about it.

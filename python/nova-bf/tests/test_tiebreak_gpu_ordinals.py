@@ -295,6 +295,25 @@ def gpu_on_cpu(monkeypatch):
 
 
 @pytest.fixture
+def host_lanes_only(monkeypatch):
+    """Force the HOST packing path by making device lane-building OOM.
+
+    `build_ordinals` now builds lanes ON the device first and only packs on the
+    host when that fails. The tests below pin the host path's TOCTOU re-check
+    (`_gpu_mode` sampled again after packing), which is real and still reachable
+    -- but only via the fallback, so they have to ask for it. Raising a
+    recognised OOM also exercises the fallback itself, which is the only way
+    the host path is reached in production.
+    """
+    import nova_bf.tiebreak as tb
+
+    def _oom(*a, **k):
+        raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    monkeypatch.setattr(tb, "_lanes_on_device", _oom)
+
+
+@pytest.fixture
 def gpu_perm_spy(monkeypatch):
     """Record every `_gpu_perm` call so a test can PROVE the fast path ran.
 
@@ -308,6 +327,12 @@ def gpu_perm_spy(monkeypatch):
     real = tb._gpu_perm
     monkeypatch.setattr(tb, "_gpu_perm",
                         lambda lanes, mode: (seen.append(mode), real(lanes, mode))[1])
+    # The device-lane path is a DIFFERENT function; spying only on `_gpu_perm`
+    # would report "the fast path did not run" for the path that is now the
+    # production one.
+    real_dev = tb._gpu_perm_from_lanes
+    monkeypatch.setattr(tb, "_gpu_perm_from_lanes",
+                        lambda lanes: (seen.append("device"), real_dev(lanes))[1])
     return seen
 
 
@@ -611,15 +636,15 @@ def test_all_paths_agree_on_a_hard_case(gpu_on_cpu, gpu_perm_spy, monkeypatch):
     assert _fixed_width([c for f in files for c in f.chunks]) == 11
 
     wide = build_ordinals(files)
-    assert gpu_perm_spy == [64], f"wide path did not run: {gpu_perm_spy}"
+    assert gpu_perm_spy == ["device"], f"device path did not run: {gpu_perm_spy}"
 
     monkeypatch.setattr(tb, "_gpu_mode", lambda total: 32)
     narrow = build_ordinals(files)
-    assert gpu_perm_spy == [64, 32], f"narrow path did not run: {gpu_perm_spy}"
+    assert gpu_perm_spy == ["device", 32], f"narrow path did not run: {gpu_perm_spy}"
 
     monkeypatch.setenv(_NO_GPU_ORDINALS, "1")
     cpu = build_ordinals(files)
-    assert gpu_perm_spy == [64, 32], "the CPU path should not have used the GPU"
+    assert gpu_perm_spy == ["device", 32], "the CPU path should not have used the GPU"
 
     ref = _arrow_reference(pa.chunked_array(
         [c for f in files for c in f.chunks]).combine_chunks())
@@ -658,7 +683,7 @@ def _mode_sequence(monkeypatch, *values):
     return calls
 
 
-def test_toctou_recheck_declining_falls_back_to_cpu(gpu_on_cpu, monkeypatch):
+def test_toctou_recheck_declining_falls_back_to_cpu(gpu_on_cpu, host_lanes_only, monkeypatch):
     """Memory taken away DURING packing: the re-check returns None and the run
     must fall back, not sort with a mode that no longer fits."""
     import nova_bf.tiebreak as tb
@@ -676,7 +701,7 @@ def test_toctou_recheck_declining_falls_back_to_cpu(gpu_on_cpu, monkeypatch):
     assert np.array_equal(got[0], _arrow_reference(arr)), "fallback answer wrong"
 
 
-def test_toctou_recheck_downgrading_uses_the_narrower_mode(gpu_on_cpu, monkeypatch):
+def test_toctou_recheck_downgrading_uses_the_narrower_mode(gpu_on_cpu, host_lanes_only, monkeypatch):
     """Memory shrank but not to nothing: the run must use the mode the SECOND
     call returned, not the first."""
     import nova_bf.tiebreak as tb
@@ -822,3 +847,101 @@ def test_packed_lanes_are_big_endian_bytes_zero_padded_on_the_right(width):
         for j in range(nl):
             want[i, j] = int.from_bytes(b[j * 8:(j + 1) * 8], "big")
     assert np.array_equal(lanes, want)
+
+
+# --------------------------------------------------------------------------
+# Device-built lanes: the two behaviours the host path did not have.
+# --------------------------------------------------------------------------
+
+def test_device_lanes_are_bit_identical_to_host_packed_lanes(gpu_on_cpu):
+    """The keys are the contract. Anything else about the device path can
+    change; these bits cannot, or the merged top-K changes."""
+    import numpy as np
+    import torch
+    import nova_bf.tiebreak as tb
+
+    for ids, why in (
+        ([f"<urn:uuid:{i:032x}>"[:47].ljust(47, "f") for i in range(1500)], "47B urn:uuid"),
+        ([f"{i:08d}" for i in range(1200)], "8B, exactly one lane"),
+        ([f"{i:09d}" for i in range(1200)], "9B, second lane is mostly padding"),
+        (["z" * 47] * 800, "all identical"),
+    ):
+        arr = pa.array(ids, pa.large_string())
+        W = tb._fixed_width([arr])
+        host = (tb._pack_lanes([arr], W, len(arr), 4) ^ np.uint64(1 << 63)).view(np.int64)
+        dev = tb._lanes_on_device([arr], W, len(arr), torch.device("cpu")).numpy()
+        assert np.array_equal(host, dev), f"lanes differ for {why}"
+
+
+def test_a_constant_lane_is_skipped_and_changes_nothing(gpu_on_cpu, monkeypatch):
+    """Every `<urn:uuid:...>` shares a 10-byte prefix, so lane 0 is constant for
+    the whole corpus and its sort pass cannot reorder anything. Skipping it must
+    be invisible in the answer and visible in the pass count."""
+    import torch
+    import nova_bf.tiebreak as tb
+
+    # Real fineweb shape: 8-4-4-4-12 hex inside `<urn:uuid:` ... `>` = 47 bytes.
+    ids = [f"<urn:uuid:{i * 2654435761 % 16**8:08x}-aaaa-bbbb-cccc-{i:012x}>"
+           for i in range(2000)]
+    arr = pa.array(ids, pa.large_string())
+    W = tb._fixed_width([arr])
+    assert W == 47 and (W + 7) // 8 == 6, (W,)
+    lanes = tb._lanes_on_device([arr], W, len(arr), torch.device("cpu"))
+    assert bool((lanes[:, 0] == lanes[0, 0]).all()), "fixture must have a constant lane 0"
+
+    sorts = []
+    real = torch.argsort
+    monkeypatch.setattr(torch, "argsort",
+                        lambda *a, **k: (sorts.append(1), real(*a, **k))[1])
+    perm = tb._gpu_perm_from_lanes(lanes)
+    assert len(sorts) < 6, f"the constant lane was still sorted ({len(sorts)} passes)"
+
+    # ...and the answer is still exactly the Arrow reference.
+    got = np.empty(len(arr), dtype=np.uint32)
+    got[perm] = np.arange(len(arr), dtype=np.uint32)
+    assert np.array_equal(got, _arrow_reference(arr))
+
+
+def test_the_device_rank_loop_does_not_clear_the_allocator(gpu_on_cpu, monkeypatch):
+    """`empty_cache()` per pass was 41.7% of CUDA API time: it synchronizes the
+    device and drops blocks the next identically-shaped pass would have reused.
+    It must not come back — a pass loop that clears the cache is a silent
+    ~5-8 s/merge regression that no correctness test would catch."""
+    import torch
+    import nova_bf.tiebreak as tb
+
+    arr = pa.array([f"{i:011d}" for i in range(3000)], pa.large_string())
+    W = tb._fixed_width([arr])
+    lanes = tb._lanes_on_device([arr], W, len(arr), torch.device("cpu"))
+
+    cleared = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: cleared.append(1))
+    tb._gpu_perm_from_lanes(lanes)
+    assert cleared == [], f"empty_cache() was called {len(cleared)} times in the loop"
+
+
+def test_device_lane_oom_falls_back_to_the_host_path(gpu_on_cpu, host_lanes_only):
+    """The device path is an optimisation, not a requirement: a box whose GPU
+    memory is taken must still produce the right ordinals."""
+    arr = pa.array(_ids(2_000, seed=7, dup=5), pa.string())
+    got = build_ordinals([arr])
+    assert np.array_equal(got[0], _arrow_reference(arr))
+
+
+def test_ids_from_lanes_handles_an_empty_single_lane_batch():
+    """n=0 with nlanes==1 (W <= 8) raised instead of returning nothing.
+
+    `.view(torch.uint8)` needs `stride(-1) == 1`, which a (0, 1) int64 tensor
+    does not have -- so the empty case worked at every width EXCEPT the
+    narrowest. Production ids are 47 bytes (nlanes=6), which is why it stayed
+    hidden; a short-id corpus would have hit it on any empty batch.
+    """
+    import torch
+
+    from nova_bf.tiebreak import ids_from_lanes
+
+    for W in (4, 8, 9, 47):
+        nlanes = (W + 7) // 8
+        out = ids_from_lanes(torch.zeros((0, nlanes), dtype=torch.int64), W)
+        assert len(out) == 0
+        assert out.to_pylist() == []

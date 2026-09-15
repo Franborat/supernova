@@ -106,7 +106,8 @@ def test_manifest_records_the_fold_that_actually_ran(tmp_path, monkeypatch, mode
     merge_mod.run_merge(cfg)
 
     doc = json.loads(
-        (tmp_path / "out" / run_manifest.manifest_name(cfg, "merge")).read_text())
+        (tmp_path / "out" / run_manifest.manifest_name(
+            cfg, "merge", search=cfg.searches[0].name)).read_text())
     assert [e["merge_fold"] for e in doc["searches"]] == [[expect]], doc["searches"]
 
 

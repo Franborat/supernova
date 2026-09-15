@@ -113,14 +113,26 @@ def _run(ds_fixed, *, device, tag):
 
 
 def _spy_gpu_perm(monkeypatch):
-    """Record `_gpu_perm` calls: the fast path fails OPEN, so a correct result
-    is no evidence it ran."""
+    """Record every device-ranking call: the fast path fails OPEN, so a correct
+    result is no evidence it ran.
+
+    TWO entry points, not one. `build_ordinals` builds its lanes ON the device
+    and ranks them with `_gpu_perm_from_lanes` whenever `_gpu_mode` says 64;
+    `_gpu_perm` now only runs for the narrow 32-bit key or the host-packed
+    fallback. Spying on `_gpu_perm` alone reports "the fast path did not run"
+    for the path that IS the fast path, which is exactly what it did.
+    Device-lane calls are recorded as the string "device" so a test can tell
+    the two apart.
+    """
     import nova_bf.tiebreak as tb
 
     seen = []
     real = tb._gpu_perm
     monkeypatch.setattr(tb, "_gpu_perm",
                         lambda lanes, mode: (seen.append(mode), real(lanes, mode))[1])
+    real_dev = tb._gpu_perm_from_lanes
+    monkeypatch.setattr(tb, "_gpu_perm_from_lanes",
+                        lambda lanes: (seen.append("device"), real_dev(lanes))[1])
     return seen
 
 
@@ -172,7 +184,7 @@ def test_gpu_wide_key_path_matches_the_oracle(ds_fixed, oracle, monkeypatch):
     seen = _spy_gpu_perm(monkeypatch)
     _assert_matches_oracle(_run(ds_fixed, device="cuda", tag="ord_gpu64"),
                            ds_fixed, oracle, "gpu-int64")
-    assert seen and set(seen) == {64}, f"tier 1 did not run: {seen}"
+    assert seen and set(seen) == {"device"}, f"tier 1 did not run: {seen}"
 
 
 @pytest.mark.skipif(not HAVE_CUDA, reason="needs CUDA")
@@ -183,7 +195,12 @@ def test_gpu_narrow_key_path_matches_the_oracle(ds_fixed, oracle, monkeypatch):
     seen = _spy_gpu_perm(monkeypatch)
     _assert_matches_oracle(_run(ds_fixed, device="cuda", tag="ord_gpu32"),
                            ds_fixed, oracle, "gpu-int32")
-    assert seen and set(seen) == {32}, f"tier 2 did not run: {seen}"
+    # `_force_mode` steers `build_ordinals` (the COMPUTE side). The merge's own
+    # `_dense_device_fold` ranks device lanes directly and is not governed by
+    # `_gpu_mode`, so "device" entries are expected alongside the 32s; what
+    # matters is that the narrow key really ran.
+    assert 32 in seen, f"tier 2 did not run: {seen}"
+    assert set(seen) <= {32, "device"}, f"unexpected ranking path: {seen}"
 
 
 @pytest.mark.skipif(not HAVE_CUDA, reason="needs CUDA")
@@ -261,6 +278,9 @@ def test_all_three_paths_produce_identical_ORDINALS():
             real = tb._gpu_perm
             mp.setattr(tb, "_gpu_perm",
                        lambda lanes, m: (seen.append(m), real(lanes, m))[1])
+            real_dev = tb._gpu_perm_from_lanes
+            mp.setattr(tb, "_gpu_perm_from_lanes",
+                       lambda lanes: (seen.append("device"), real_dev(lanes))[1])
             out = tb.build_ordinals(cols)
             return out, seen
         finally:
@@ -270,7 +290,9 @@ def test_all_three_paths_produce_identical_ORDINALS():
     narrow, seen32 = run(mode=32)
     cpu, seencpu = run(kill=True)
 
-    assert seen64 == [64], f"wide-key path did not run: {seen64}"
+    # Mode 64 now ranks lanes built ON the device; `_gpu_perm` is the
+    # narrow-key/host-packed path only.
+    assert seen64 == ["device"], f"wide-key path did not run: {seen64}"
     assert seen32 == [32], f"narrow-key path did not run: {seen32}"
     assert seencpu == [], f"CPU path unexpectedly used the GPU: {seencpu}"
 

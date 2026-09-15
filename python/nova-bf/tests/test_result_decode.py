@@ -287,38 +287,44 @@ def test_explicit_merge_batch_size_is_obeyed_and_warned_about(caplog):
     ceiling = _TARGET_CANDIDATE_SLOTS // (2 * k)
 
     with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
-        got = _resolve_batch_rows(50_000, n_rows, n_partials, k)
+        got = _resolve_batch_rows(50_000, n_rows, k)
     assert got == 50_000, f"explicit value must be obeyed, got {got}"
-    assert "honoring it" in caplog.text, "going over the auto target must warn"
+    # Pin that a warning fired and names the value, not the exact wording: the
+    # phrase this used to match ("honoring it") was reworded and the test went
+    # red for a prose change while the behaviour was intact.
+    assert "merge_batch_size=50000" in caplog.text, (
+        "going over the auto target must warn, naming the value")
 
     # under the ceiling: honoured exactly, and silent
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
-        assert _resolve_batch_rows(10, n_rows, n_partials, k) == 10
+        assert _resolve_batch_rows(10, n_rows, k) == 10
     assert caplog.text == "", "a value inside the target has nothing to warn about"
 
-    # The shape that used to be unusable. Fanning in 256 partials no longer
-    # narrows the batch at all: only `k` does, because only `k` widens the grid.
-    assert _resolve_batch_rows(None, n_rows, 256, 10_000) == \
+    # The shape that used to be unusable: only `k` narrows the batch, because
+    # only `k` widens the grid.
+    assert _resolve_batch_rows(None, n_rows, 10_000) == \
         _TARGET_CANDIDATE_SLOTS // (2 * 10_000)
-    # ...and it is independent of the partial count, which is the actual fix.
-    assert (_resolve_batch_rows(None, n_rows, 4, 10_000)
-            == _resolve_batch_rows(None, n_rows, 256, 10_000))
+    # Independence from the partial count used to be asserted here by comparing
+    # a 4-partial call against a 256-partial one. The fan-in is no longer a
+    # PARAMETER, so that comparison cannot be written -- and does not need to
+    # be: the function cannot depend on what it cannot see. Structural, not
+    # tested, which is the stronger guarantee.
     with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
-        assert _resolve_batch_rows(20_000, n_rows, 256, 10_000) == 20_000
+        assert _resolve_batch_rows(20_000, n_rows, 10_000) == 20_000
 
     # still capped by the query count — asking for more rows than exist is not
     # a memory question, it is just wrong
-    assert _resolve_batch_rows(50_000, 300, n_partials, k) == 300
+    assert _resolve_batch_rows(50_000, 300, k) == 300
     # ...and never zero or negative
-    assert _resolve_batch_rows(0, n_rows, n_partials, k) == 1
-    assert _resolve_batch_rows(-5, n_rows, n_partials, k) == 1
+    assert _resolve_batch_rows(0, n_rows, k) == 1
+    assert _resolve_batch_rows(-5, n_rows, k) == 1
 
     # auto path unchanged
-    assert _resolve_batch_rows(None, n_rows, n_partials, k) == ceiling
+    assert _resolve_batch_rows(None, n_rows, k) == ceiling
     # a tiny corpus still bounds by n_rows
-    assert _resolve_batch_rows(None, 5, n_partials, k) == 5
+    assert _resolve_batch_rows(None, 5, k) == 5
     # never zero. It takes a genuinely absurd `k` to floor the ceiling now —
     # a 100k fan-in no longer does it, because the fan-in is not in the sizing.
-    assert _resolve_batch_rows(None, 1_000_000, 100_000, 100_000) == 100
-    assert _resolve_batch_rows(None, 1_000_000, 4, _TARGET_CANDIDATE_SLOTS) == 1
+    assert _resolve_batch_rows(None, 1_000_000, 100_000) == 100
+    assert _resolve_batch_rows(None, 1_000_000, _TARGET_CANDIDATE_SLOTS) == 1

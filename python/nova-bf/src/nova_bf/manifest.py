@@ -50,6 +50,7 @@ def manifest_name(
     phase: str,
     job_rank: int | None = None,
     num_jobs: int | None = None,
+    search: str | None = None,
 ) -> str:
     """Where this run's manifest goes, under `cfg.output.path`.
 
@@ -61,6 +62,8 @@ def manifest_name(
     output root next to the result parquets.
     """
     stem = f"_bf_manifest_{queries_stem(cfg.queries.path)}_{phase}"
+    if search is not None:
+        return f"{stem}/{search}.json"
     if job_rank is None or num_jobs is None:
         return f"{stem}.json"
     width = max(3, len(str(num_jobs - 1)))

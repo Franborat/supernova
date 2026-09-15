@@ -11,6 +11,8 @@ such mixture on purpose and assert the merge refuses it.
 from __future__ import annotations
 
 import json
+import os
+import pathlib
 
 import numpy as np
 import pytest
@@ -391,7 +393,8 @@ def test_forcing_merges_a_drifted_config_and_says_so_everywhere(
         "a forced artifact must carry the marker; without it the file is "
         "indistinguishable from verified ground truth")
 
-    doc = json.loads((out / manifest_name(cfg, "merge")).read_text())
+    doc = json.loads((out / manifest_name(
+        cfg, "merge", search=cfg.searches[0].name)).read_text())
     assert doc.get("merge_forced") is True, "the manifest is what a human reads first"
     assert paths, "the merge still produced its output"
 
@@ -406,7 +409,8 @@ def test_a_clean_merge_carries_no_forced_marker(ds, tmp_path, monkeypatch):
     run_merge(cfg)
 
     assert FORCED_KEY not in _artifact_meta(out / result_name(cfg, cfg.searches[0]))
-    doc = json.loads((out / manifest_name(cfg, "merge")).read_text())
+    doc = json.loads((out / manifest_name(
+        cfg, "merge", search=cfg.searches[0].name)).read_text())
     assert "merge_forced" not in doc
 
 
@@ -470,7 +474,8 @@ def test_forcing_does_not_launder_through_a_re_merge(ds, tmp_path, monkeypatch):
     assert _artifact_meta(
         out2 / result_name(cfg2, cfg2.searches[0])).get(FORCED_KEY) == b"true", (
         "a clean re-merge laundered the forced marker off its input")
-    doc2 = json.loads((out2 / manifest_name(cfg2, "merge")).read_text())
+    doc2 = json.loads((out2 / manifest_name(
+        cfg2, "merge", search=cfg2.searches[0].name)).read_text())
     assert doc2.get("merge_forced") is True, (
         "the parquet kept the marker but the manifest -- what a human reads "
         "first -- came out clean")
@@ -757,3 +762,719 @@ def test_the_merge_window_is_a_config_field(ds, tmp_path):
         raw["params"]["merge_window"] = bad
         with pytest.raises(pydantic.ValidationError):
             BruteForceConfig(**raw)
+
+
+# --------------------------------------------------------------------------
+# `--search`: reduce one search per process, so four searches can use a box
+# that one merge leaves ~97% idle.
+# --------------------------------------------------------------------------
+
+def _two_search_cfg(ds, out, **params):
+    return BruteForceConfig(
+        corpus=CorpusConfig(path=ds["cdir"], id_column="id"),
+        queries=QueriesConfig(path=ds["qpath"], id_column="qid"),
+        output=OutputConfig(path=str(out)),
+        params=ParamsConfig(io_workers=2, **params),
+        searches=[SearchSpec(name="alpha", metric="dot", k=K),
+                  SearchSpec(name="beta", metric="cosine", k=K)],
+    )
+
+
+def test_only_reduces_the_named_search(ds, tmp_path):
+    """One process, one search: the others' outputs must not appear."""
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+
+    got = run_merge(cfg, only={"alpha"})
+    assert set(got) == {"alpha"}
+    assert (out / result_name(cfg, cfg.searches[0])).exists()
+    assert not (out / result_name(cfg, cfg.searches[1])).exists()
+
+    # ...and the second process completes the set without disturbing the first.
+    run_merge(cfg, only={"beta"})
+    assert (out / result_name(cfg, cfg.searches[1])).exists()
+
+
+def test_each_restricted_merge_writes_its_own_manifest(ds, tmp_path):
+    """Four processes must not race for one manifest key.
+
+    Asserted by running both restricted merges and checking BOTH manifests
+    survive: a single shared name would leave only the last writer's.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+
+    run_merge(cfg, only={"alpha"})
+    run_merge(cfg, only={"beta"})
+    for name in ("alpha", "beta"):
+        path = out / manifest_name(cfg, "merge", search=name)
+        assert path.exists(), f"{name}'s manifest was clobbered"
+        doc = json.loads(path.read_text())
+        assert [s["name"] for s in doc["searches"]] == [name], (
+            "a per-search manifest must describe only its own search")
+    assert not (out / manifest_name(cfg, "merge")).exists(), (
+        "merge writes one manifest per search and never a run-level one")
+
+
+def test_a_restricted_merge_still_validates_every_search(ds, tmp_path):
+    """`only` restricts the REDUCE, not the CHECKS.
+
+    A rank that died partway through writing its per-search outputs leaves the
+    searches with different partial counts — which is only visible by looking
+    at searches this process is not reducing. Scoping the checks to the named
+    search would delete exactly the evidence they exist to find.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    # `beta` loses a rank; `alpha` is untouched and is all this process reduces.
+    sorted((out / partial_dir(cfg, cfg.searches[1])).glob("*.parquet"))[1].unlink()
+
+    with pytest.raises(RuntimeError, match="mismatched partial counts"):
+        run_merge(cfg, only={"alpha"})
+
+
+def test_an_unknown_search_name_is_refused(ds, tmp_path):
+    """A typo'd --search must not silently merge nothing and report success."""
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+
+    with pytest.raises(RuntimeError, match="does not define|alpha"):
+        run_merge(cfg, only={"alhpa"})
+
+
+# --------------------------------------------------------------------------
+# `_validate_one_run`'s metadata-sanity guards. Each of these refuses a shape
+# that is CORRUPT rather than merely unverified, so none is forceable.
+# --------------------------------------------------------------------------
+
+def _pairs(specs, cfg, spec):
+    """(partials, readers) from (rank, num_jobs, filename) triples."""
+    from nova_bf.results import CONFIG_KEY, config_identity
+    sha = config_identity(cfg, spec).encode()
+    ps, rs = [], []
+    for rank, num_jobs, name in specs:
+        f, r = _stamped(rank, num_jobs=num_jobs) if num_jobs is not None else _stamped(rank)
+        if name is not None:
+            f = type(f)(read_path="dir/" + name)
+        r.schema_arrow.metadata[CONFIG_KEY] = sha
+        ps.append(f); rs.append(r)
+    return ps, rs
+
+
+def test_a_negative_job_rank_is_refused(ds, tmp_path):
+    """`job_rank=-1` is corrupt metadata. It slips past the 0..num_jobs-1 range
+    check in an UNSHARDED directory, where `num_jobs` is absent and that check
+    never runs at all — so it needs its own guard, not the range test."""
+    from nova_bf import merge as m
+
+    cfg = _cfg(ds, tmp_path / "out")
+    spec = cfg.searches[0]
+    ps, rs = _pairs([(-1, None, "a.parquet"), (1, None, "b.parquet")], cfg, spec)
+    with pytest.raises(RuntimeError, match="non-negative"):
+        m._validate_one_run(cfg, spec, ps, rs, forced=True)
+
+
+@pytest.mark.parametrize("raw,why", [("abc", "not an integer"), ("0", "must be positive"),
+                                     ("-4", "must be positive")])
+def test_a_corrupt_num_jobs_is_diagnosed_not_crashed(ds, tmp_path, raw, why):
+    """`int(declared.pop())` on junk used to raise a bare ValueError traceback.
+    An operator needs to be told the metadata is corrupt, not handed a stack."""
+    from nova_bf import merge as m
+
+    cfg = _cfg(ds, tmp_path / "out")
+    spec = cfg.searches[0]
+    ps, rs = _pairs([(0, raw, None), (1, raw, None)], cfg, spec)
+    with pytest.raises(RuntimeError, match=why):
+        m._validate_one_run(cfg, spec, ps, rs, forced=True)
+
+
+def test_partials_and_readers_must_be_the_same_length(ds, tmp_path):
+    """They are zipped; a mismatch would silently truncate the rank set and
+    could turn a missing rank into an invisible one."""
+    from nova_bf import merge as m
+
+    cfg = _cfg(ds, tmp_path / "out")
+    spec = cfg.searches[0]
+    ps, rs = _pairs([(0, "2", None), (1, "2", None)], cfg, spec)
+    with pytest.raises(RuntimeError, match="but opened"):
+        m._validate_one_run(cfg, spec, ps, rs[:1], forced=True)
+
+
+def test_an_empty_partial_list_is_refused(ds, tmp_path):
+    """Defence in depth: `run_merge` catches this earlier, but a direct caller
+    must not get a silent success over nothing."""
+    from nova_bf import merge as m
+
+    cfg = _cfg(ds, tmp_path / "out")
+    with pytest.raises(RuntimeError, match="no partials"):
+        m._validate_one_run(cfg, cfg.searches[0], [], [], forced=True)
+
+
+def test_partials_with_no_config_fingerprint_warn_rather_than_pass_silently(
+    ds, tmp_path, caplog
+):
+    """A MISSING config fingerprint used to be read as a MATCHING one.
+
+    `(_get(meta, CONFIG_KEY) or want_config) != want_config` treats absent as
+    equal, so a directory that could not be checked at all looked exactly like
+    one that passed. Absence must be visible — this is the same "absent is not
+    verified" trap that produced the forced-marker laundering bug.
+    """
+    import logging
+    from nova_bf import merge as m
+    from nova_bf.results import CONFIG_KEY
+
+    cfg = _cfg(ds, tmp_path / "out")
+    spec = cfg.searches[0]
+    ps, rs = _pairs([(0, "2", None), (1, "2", None)], cfg, spec)
+    for r in rs:
+        del r.schema_arrow.metadata[CONFIG_KEY]
+    with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
+        m._validate_one_run(cfg, spec, ps, rs, forced=False)
+    assert any("config fingerprint" in r.message for r in caplog.records), (
+        "unverifiable config must be logged, not silently accepted")
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cpu"])
+def test_run_merge_output_is_identical_across_fold_backends(ds, tmp_path, monkeypatch, backend):
+    """END TO END through `run_merge`, not through `_topk_merge`.
+
+    The unit tests compare the two folds on hand-built ListArrays. This drives
+    a real compute + merge and compares the written parquet, so it also covers
+    the batching, the partial-major loop, the running-state handoff between
+    folds, and the Arrow assembly — everywhere a fast path can be right in
+    isolation and wrong in the pipeline.
+
+    `numpy` is the reference: it predates all of this and shares no code with
+    the device path beyond `_assemble`.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _cfg(ds, out)
+    _run(cfg, 2)
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", backend)
+    run_merge(cfg)
+    t = pq.read_table(str(out / result_name(cfg, cfg.searches[0])))
+    got = {r["query_id"]: (r["hit_ids"], r["hit_scores"]) for r in t.to_pylist()}
+
+    # The reference, recomputed in-process so the comparison cannot go stale.
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "numpy")
+    out2 = tmp_path / "ref"
+    out2.mkdir()
+    cfg2 = _cfg(ds, out2)
+    _run(cfg2, 2)
+    run_merge(cfg2)
+    t2 = pq.read_table(str(out2 / result_name(cfg2, cfg2.searches[0])))
+    ref = {r["query_id"]: (r["hit_ids"], r["hit_scores"]) for r in t2.to_pylist()}
+
+    assert set(got) == set(ref)
+    for q in ref:
+        assert got[q][0] == ref[q][0], f"query {q}: hit ids differ under {backend}"
+        assert got[q][1] == ref[q][1], f"query {q}: hit scores differ under {backend}"
+
+
+def _write_cfg(cfg, path):
+    import yaml
+    pathlib.Path(path).write_text(yaml.safe_dump(cfg.model_dump(mode="json")))
+    return str(path)
+
+
+def test_jobs_fans_out_one_process_per_search(ds, tmp_path):
+    """`--jobs N` must reduce N searches concurrently and produce the FULL set.
+
+    Driven through the real CLI, not by calling the helper: the point of the
+    flag is that an operator does not have to orchestrate this, so the thing
+    under test is the command, the child invocations, and the outputs landing.
+    """
+    import subprocess
+    import sys
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    r = subprocess.run(
+        [sys.executable, "-m", "nova_bf.cli", "merge", path, "--jobs", "2"],
+        capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path("src").resolve())})
+    assert r.returncode == 0, r.stderr[-2000:]
+    for spec in cfg.searches:
+        assert (out / result_name(cfg, spec)).exists(), f"{spec.name} output missing"
+        assert (out / manifest_name(cfg, "merge", search=spec.name)).exists()
+    assert "started" in r.stderr and "finished" in r.stderr
+
+
+def test_jobs_preflights_whole_run_failures_once(ds, tmp_path):
+    """A dead rank fails EVERY search, so it must be diagnosed ONCE.
+
+    The partial-count check is cross-search by nature, so without a pre-flight
+    every child runs it and every child fails: measured, four identical
+    tracebacks interleaved on stderr with the one useful line buried among
+    them. The parent should refuse before spawning anything.
+    """
+    import subprocess
+    import sys
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    sorted((out / partial_dir(cfg, cfg.searches[1])).glob("*.parquet"))[1].unlink()
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    r = subprocess.run(
+        [sys.executable, "-m", "nova_bf.cli", "merge", path, "--jobs", "2"],
+        capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path("src").resolve())})
+    assert r.returncode != 0
+    assert "mismatched partial counts" in r.stderr
+    assert "refusing to fan out" in r.stderr
+    assert r.stderr.count("mismatched partial counts") == 1, (
+        "the whole-run failure was reported once per child instead of once")
+    assert "started" not in r.stderr, "children were spawned despite a whole-run failure"
+
+
+def test_jobs_reports_a_per_search_failure_as_incomplete(ds, tmp_path):
+    """A failure that hits ONE search must say the output set is incomplete.
+
+    This is the dangerous shape: the other searches wrote fresh output, so the
+    prefix looks finished. The exit code and message are the only record.
+    """
+    import subprocess
+    import sys
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    # Row-misalign ONE search's partial: realistic after a rank died mid-write.
+    # Partial counts still match, so the pre-flight passes and the failure is
+    # per-search, inside that child's reduce.
+    victim = sorted((out / partial_dir(cfg, cfg.searches[1])).glob("*.parquet"))[1]
+    t = pq.read_table(str(victim))
+    pq.write_table(t.slice(0, max(1, t.num_rows - 1)).replace_schema_metadata(
+        t.schema.metadata), str(victim))
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    r = subprocess.run(
+        [sys.executable, "-m", "nova_bf.cli", "merge", path, "--jobs", "2"],
+        capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path("src").resolve())})
+    assert r.returncode != 0, "a failed search must not exit zero"
+    assert "INCOMPLETE" in r.stderr, (
+        "the operator must be told the output set is incomplete, not just that "
+        "one process failed")
+    assert "--search" in r.stderr, "the message must name the recovery command"
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_jobs_below_one_is_refused(ds, tmp_path, bad):
+    """`-j 0` silently ran a SERIAL merge and, because `only` was then None,
+    also wrote the whole-run manifest into a prefix merged per-search. A typo
+    for `-j 4` must not quietly change the manifest layout."""
+    import subprocess
+    import sys
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    r = subprocess.run(
+        [sys.executable, "-m", "nova_bf.cli", "merge", path, "--jobs", bad],
+        capture_output=True, text=True,
+        env={**os.environ, "PYTHONPATH": str(pathlib.Path("src").resolve())})
+    assert r.returncode != 0 and "at least 1" in (r.stderr + r.stdout)
+    assert not list(out.glob("bf_*.parquet")), "a refused --jobs must not merge"
+
+
+def test_merge_writes_one_manifest_per_search_and_no_run_level_one(ds, tmp_path):
+    """ONE LAYOUT. There used to be two -- a run-level `<stem>_merge.json` and a
+    per-search `<stem>_merge/<name>.json` -- and whichever a given merge did not
+    write was left beside outputs it no longer described. Reconciling them
+    produced a bug in every review round: deleted one way but not the other;
+    deleted by config-derived name so a renamed search kept an orphan; a
+    carry-over that raced four `--jobs` children; and finally a parent that
+    destroyed a still-accurate record before any work had been done.
+
+    Now a whole-run merge writes N per-search manifests and a `--search` merge
+    writes one, so re-merging a single search overwrites exactly its own record
+    and touches nothing else.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+
+    run_merge(cfg)
+    assert not (out / manifest_name(cfg, "merge")).exists(), (
+        "merge must not write a run-level manifest")
+    for name in ("alpha", "beta"):
+        assert (out / manifest_name(cfg, "merge", search=name)).exists()
+
+    # Re-merging one search leaves the other's record alone.
+    beta = out / manifest_name(cfg, "merge", search="beta")
+    before = beta.read_text()
+    run_merge(cfg, only={"alpha"})
+    assert beta.read_text() == before, (
+        "a --search merge rewrote a search it did not reduce")
+
+
+def _plant_legacy(cfg, out):
+    """Put the prefix in the state an OLDER BUILD would have left it in.
+
+    That means the parquets exist and the run-level manifest describes them,
+    but the per-search manifests this build writes do not exist -- which is the
+    whole reason the legacy file is worth keeping. Planting it beside a set of
+    per-search manifests would not test anything: the legacy file would be
+    redundant and dropping it would lose nothing.
+    """
+    run_merge(cfg)
+    for spec in cfg.searches:
+        (out / manifest_name(cfg, "merge", search=spec.name)).unlink()
+    legacy = out / manifest_name(cfg, "merge")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps({"searches": [
+        {"name": s.name, "output_file": result_name(cfg, s)}
+        for s in cfg.searches]}))
+    return legacy
+
+
+def test_the_legacy_manifest_goes_only_once_nothing_it_describes_is_orphaned(
+        ds, tmp_path):
+    """A prefix merged by an older build still has `<stem>_merge.json`.
+
+    The rule is about FILES, not about whether the merge was called whole-run:
+    a merge that has rewritten every parquet the legacy file names may retire
+    it, and one that left any of them untouched may not -- that parquet would
+    be left with no record at all, and `--search NAME` is the documented
+    recovery path, so a subset merge is a likely first touch on a legacy prefix.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+
+    legacy = _plant_legacy(cfg, out)
+    body = legacy.read_text()
+    run_merge(cfg, only={"alpha"})
+    assert legacy.exists() and legacy.read_text() == body, (
+        "a subset merge destroyed the only record beta's output had")
+
+    run_merge(cfg)
+    assert not legacy.exists(), (
+        "this merge rewrote every parquet the legacy file named, so it should "
+        "have superseded it")
+
+    # An explicit --search set that covers everything counts too.
+    legacy = _plant_legacy(cfg, out)
+    run_merge(cfg, only={"alpha", "beta"})
+    assert not legacy.exists()
+
+
+
+def test_jobs_one_does_not_fan_out(ds, tmp_path, monkeypatch):
+    """The default path must stay in-process: no subprocesses, no behaviour
+    change for anyone who does not ask for concurrency."""
+    import nova_bf.cli as cli_mod
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    called = []
+    monkeypatch.setattr(cli_mod, "_merge_fanout",
+                        lambda *a, **k: called.append(1) or 0)
+    from click.testing import CliRunner
+    res = CliRunner().invoke(cli_mod.main, ["merge", path])
+    assert res.exit_code == 0, res.output
+    assert called == [], "--jobs 1 must not spawn child processes"
+    assert (out / result_name(cfg, cfg.searches[0])).exists()
+
+
+def test_a_repeated_search_flag_does_not_start_two_children_for_it(
+        ds, tmp_path, monkeypatch):
+    """`--search alpha --search alpha` must reduce alpha ONCE.
+
+    `_merge_fanout` used to key its child table by search name, so the second
+    `Popen` overwrote the first entry: that child was never polled, never
+    waited on and never terminated by the `finally` -- exactly the invisible
+    orphan that block exists to prevent -- while two processes wrote the same
+    output key concurrently. The command still exited 0. Config validation
+    forbids duplicate search NAMES, so only the flag side could produce it
+    (scripted flag accumulation, copy-paste), and it gave no signal at all.
+    """
+    import nova_bf.cli as cli_mod
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    seen: list[list[str]] = []
+    monkeypatch.setattr(cli_mod, "_merge_fanout",
+                        lambda config, names, jobs: seen.append(names) or 0)
+    from click.testing import CliRunner
+    res = CliRunner().invoke(
+        cli_mod.main,
+        ["merge", path, "-j", "2", "--search", "alpha", "--search", "alpha",
+         "--search", "beta"])
+    assert res.exit_code == 0, res.output
+    assert seen == [["alpha", "beta"]], seen
+
+
+def test_the_fanout_child_table_is_keyed_per_child_not_per_name(
+        tmp_path, monkeypatch):
+    """Even given a duplicate, every child must stay reachable for the `finally`.
+
+    The dedupe above is the first line of defence; this pins the second. The
+    table used to be keyed by search NAME, so two children for one name meant
+    the first entry was overwritten and that process was never polled, waited
+    on, or terminated -- an orphan merge writing the output prefix invisibly.
+    """
+    import subprocess
+    import sys
+    import time
+
+    import nova_bf.cli as cli_mod
+    import nova_bf.config as config_mod
+    import nova_bf.merge as merge_mod
+
+    # Patch the name `cli` RESOLVES, not the one it came from: cli.py imports
+    # `load_config` at module scope, so `nova_bf.config.load_config` is a
+    # different binding and patching it no longer intercepts the call.
+    monkeypatch.setattr(cli_mod, "load_config", lambda p: object())
+    monkeypatch.setattr(merge_mod, "preflight_searches", lambda cfg: None)
+
+    started: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def sleeper(cmd, *a, **kw):
+        proc = real_popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        started.append(proc)
+        return proc
+
+    real_sleep = time.sleep
+    fired: list[int] = []
+
+    def stop_waiting(seconds):
+        # ONCE. `Popen.wait(timeout=...)` also calls `time.sleep`, so a handler
+        # that keeps raising fires again inside the cleanup this test is trying
+        # to observe -- the failure then points at `subprocess._wait` instead of
+        # at the child that escaped.
+        if not fired:
+            fired.append(1)             # both children are registered by now
+            raise RuntimeError("stop waiting")
+        return real_sleep(seconds)
+
+    monkeypatch.setattr(subprocess, "Popen", sleeper)
+    monkeypatch.setattr(time, "sleep", stop_waiting)
+    try:
+        with pytest.raises(RuntimeError, match="stop waiting"):
+            cli_mod._merge_fanout(str(tmp_path / "cfg.yaml"), ["a", "a"], 2)
+    finally:
+        monkeypatch.setattr(subprocess, "Popen", real_popen)
+
+    assert len(started) == 2, "both children must have been launched"
+    for proc in started:
+        proc.wait(timeout=30)
+        assert proc.poll() is not None, "a child escaped the fan-out's cleanup"
+
+
+def test_a_search_manifest_lands_with_its_own_output_not_at_the_end(
+        ds, tmp_path, monkeypatch):
+    """A merge that dies on search N must not leave 1..N-1 misdescribed.
+
+    Collecting every entry and writing the manifests at the end meant the
+    earlier searches had FRESHLY REWRITTEN parquets and their PREVIOUS merge's
+    manifests. Measured two ways: a forced re-merge left alpha's parquet stamped
+    `merge_forced=true` beside a manifest saying nothing of the kind, and a
+    re-merge after a third rank landed left alpha's parquet carrying
+    `num_jobs=3` beside a manifest still claiming `partials: 2`. The parquet
+    self-describes correctly in both, so ground truth is intact -- but the
+    record contradicts it, and the record is the stale one.
+    """
+    import nova_bf.merge as merge_mod
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    run_merge(cfg)                                   # a clean baseline
+
+    alpha_man = out / manifest_name(cfg, "merge", search="alpha")
+    before = json.loads(alpha_man.read_text())
+    assert before.get("merge_forced") is None
+
+    real_reduce = merge_mod._reduce
+
+    def reduce_then_die(cfg_, spec, *a, **kw):
+        entry = real_reduce(cfg_, spec, *a, **kw)
+        if spec.name == "beta":
+            raise RuntimeError("injected failure on the second search")
+        return entry
+
+    monkeypatch.setattr(merge_mod, "_reduce", reduce_then_die)
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "1")
+    with pytest.raises(RuntimeError, match="injected failure"):
+        run_merge(cfg)
+
+    after = json.loads(alpha_man.read_text())
+    assert after.get("merge_forced") is True, (
+        "alpha's parquet was rewritten by a forced merge but its manifest is "
+        "still the previous merge's, claiming verified ground truth")
+    assert after["started_at"] != before["started_at"]
+
+
+def test_a_jobs_fanout_retires_the_legacy_run_level_manifest(ds, tmp_path,
+                                                             monkeypatch):
+    """Every child is a subset merge, so none of them may drop it.
+
+    That left a fan-out unable to complete the migration off a prefix an older
+    build merged: the legacy file sat beside N fresh per-search manifests
+    describing the same parquets. The parent does it, after the children
+    succeed and only when they covered every search.
+    """
+    import nova_bf.cli as cli_mod
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    legacy = _plant_legacy(cfg, out)
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    assert cli_mod._merge_fanout(path, ["alpha", "beta"], 2) == 0
+    assert not legacy.exists(), "the fan-out left the legacy manifest behind"
+    for name in ("alpha", "beta"):
+        assert (out / manifest_name(cfg, "merge", search=name)).exists()
+
+
+def test_a_partial_fanout_leaves_the_legacy_manifest_alone(ds, tmp_path):
+    """Covering only some searches, it is still the others' only record."""
+    import nova_bf.cli as cli_mod
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    legacy = _plant_legacy(cfg, out)
+    body = legacy.read_text()
+    path = _write_cfg(cfg, tmp_path / "cfg.yaml")
+
+    assert cli_mod._merge_fanout(path, ["alpha"], 2) == 0
+    assert legacy.exists() and legacy.read_text() == body
+
+
+def test_the_legacy_manifest_survives_if_it_still_records_a_dropped_search(
+        ds, tmp_path):
+    """"This merge replaced every output it claimed" is only true while the
+    config still covers what the legacy file described.
+
+    Drop a search from the config -- because it is being recomputed, say -- and
+    a whole-run merge no longer touches its parquet, which was then left on the
+    prefix with no manifest of any kind. The `--search` path is guarded against
+    this by construction; this is the same guard for the whole-run path.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg2 = _two_search_cfg(ds, out)
+    _run(cfg2, 2)
+    run_merge(cfg2)                                  # alpha + beta on disk
+
+    legacy = _plant_legacy(cfg2, out)
+
+    # beta is dropped from the config; a whole-run merge now covers alpha only.
+    cfg1 = _two_search_cfg(ds, out)
+    cfg1.searches = [cfg1.searches[0]]
+    run_merge(cfg1)
+    assert legacy.exists(), (
+        "the legacy manifest was dropped although beta's parquet is still on "
+        "disk and it is that parquet's only record")
+
+    # Once beta's output is gone too, nothing needs it.
+    (out / result_name(cfg2, cfg2.searches[1])).unlink()
+    run_merge(cfg1)
+    assert not legacy.exists()
+
+
+def test_the_legacy_manifest_survives_a_k_change_that_orphans_a_parquet(
+        ds, tmp_path):
+    """The guard is keyed on FILES, not search names.
+
+    `result_name` is `bf_<stem>_<name>_k<K>.parquet`, so bumping `k` -- a
+    routine config edit -- leaves the old parquet untouched on the prefix while
+    the per-search manifest (which has no `k` in its name) is overwritten by the
+    new one. Keyed on names, the guard saw "alpha is in `written`, this run
+    rewrote it" and dropped the legacy file, orphaning the k=4 parquet: the very
+    state the guard exists to prevent, reached without dropping any search.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+    run_merge(cfg)
+    old_alpha = out / result_name(cfg, cfg.searches[0])
+    assert old_alpha.exists()
+
+    legacy = _plant_legacy(cfg, out)
+
+    bigger = _two_search_cfg(ds, out)
+    for spec in bigger.searches:
+        spec.k = cfg.searches[0].k + 1
+    _run(bigger, 2)
+    run_merge(bigger)
+
+    assert old_alpha.exists(), "fixture: the old-k parquet should still be here"
+    assert legacy.exists(), (
+        "the legacy manifest was dropped although the previous k's parquets "
+        "are still on disk with nothing else describing them")
+
+
+@pytest.mark.parametrize("body", [
+    '{"searches": ["alpha"]}',              # a list of strings
+    '{"searches": "alpha"}',                # a string
+    '{"searches": 7}',                      # a number
+    '[{"name": "alpha"}]',                  # the doc is a list
+    '{"searches": [{"output_file": {"a": 1}}]}',   # unhashable output_file
+    'not json at all',
+    '',
+])
+def test_a_malformed_legacy_manifest_never_fails_a_finished_merge(
+        ds, tmp_path, body):
+    """The legacy file is read AFTER every parquet and manifest has landed.
+
+    Anything that raises while inspecting it turns a wholly successful merge
+    into a non-zero exit, and the outputs are already on disk by then. Each of
+    these shapes raised out of `run_merge` when the iteration sat outside the
+    read's `try` -- `AttributeError` on a list of strings, `TypeError:
+    unhashable type` on a dict `output_file`.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _two_search_cfg(ds, out)
+    _run(cfg, 2)
+
+    legacy = out / manifest_name(cfg, "merge")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(body)
+
+    paths = run_merge(cfg)                       # must not raise
+    assert set(paths) == {"alpha", "beta"}
+    for name in ("alpha", "beta"):
+        assert (out / manifest_name(cfg, "merge", search=name)).exists()

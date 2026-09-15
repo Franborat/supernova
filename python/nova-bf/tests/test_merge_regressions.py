@@ -9,7 +9,9 @@ thread and fails on timeout rather than blocking the suite.
 
 from __future__ import annotations
 
+import contextlib
 import gc
+import json
 import threading
 import time
 import weakref
@@ -393,9 +395,20 @@ def test_ranged_get_pool_is_divided_by_the_window(tmp_path, monkeypatch):
     # `max(1, ...)`, not `max(2, ...)`: a floor of 2 breached the pool above
     # window_n=12. This agreed with the code only because window_n is 4 here.
     expected = max(1, merge_mod._RANGED_GET_POOL // window_n)
-    assert set(concurrencies) == {expected}, concurrencies
-    # the product is what matters: it must stay at or under the pool
-    assert window_n * expected <= merge_mod._RANGED_GET_POOL
+    pool = merge_mod._RANGED_GET_POOL
+
+    # THE FIRST PARTIAL IS DELIBERATELY AN EXCEPTION: it gets the whole pool,
+    # because nothing can be folded until one partial has fully arrived and an
+    # evenly divided pool makes every file take the same time whether it is
+    # alone or not. Exactly one reader may do this.
+    assert concurrencies.count(pool) == 1, (
+        f"expected exactly one full-pool reader (the first): {concurrencies}")
+    rest = [c for c in concurrencies if c != pool]
+    assert set(rest) == {expected}, rest
+
+    # STEADY STATE stays within the pool; the first partial's overshoot is
+    # bounded by one file and ends as soon as it lands.
+    assert window_n * expected <= pool
 
 
 # ---------------------------------------------------------------------------
@@ -409,14 +422,15 @@ def test_auto_batch_size_matches_the_two_way_fold():
     loop and is 32x too small at W=64 — 32x the fold calls, and one parquet row
     group per batch in the artifact people consume."""
     n_partials, k, n_rows = 64, 1000, 100_000
-    rows = merge_mod._resolve_batch_rows(None, n_rows, n_partials, k)
+    rows = merge_mod._resolve_batch_rows(None, n_rows, k)
     slots = rows * 2 * k
     assert slots <= merge_mod._TARGET_CANDIDATE_SLOTS
     assert slots > merge_mod._TARGET_CANDIDATE_SLOTS * 0.9, (
         f"batch_rows={rows} uses only {slots/1e6:.2f} M of the "
         f"{merge_mod._TARGET_CANDIDATE_SLOTS/1e6:.0f} M target")
-    # ...and it must not depend on the partial count any more.
-    assert rows == merge_mod._resolve_batch_rows(None, n_rows, 2, k)
+    # This used to assert the same call with a different partial count returned
+    # the same rows. The fan-in is no longer a parameter, so that comparison is
+    # now `rows == rows`; independence is structural rather than tested.
 
 
 def test_fold_is_never_wider_than_two_and_does_not_fragment_the_output(
@@ -431,9 +445,11 @@ def test_fold_is_never_wider_than_two_and_does_not_fragment_the_output(
     widths: list[int] = []
     real = merge_mod._topk_merge
 
-    def spy(score_lists, id_lists, tie_lists, k):
+    def spy(score_lists, id_lists, tie_lists, k, **kw):
+        # **kw so the spy survives optional arguments; this test
+        # pins the fold WIDTH, not `_topk_merge`'s signature.
         widths.append(len(score_lists))
-        return real(score_lists, id_lists, tie_lists, k)
+        return real(score_lists, id_lists, tie_lists, k, **kw)
 
     monkeypatch.setattr(merge_mod, "_topk_merge", spy)
     merge_mod.run_merge(cfg)
@@ -996,3 +1012,700 @@ def test_a_null_inside_a_hit_list_is_refused(tmp_path, col):
     pq.write_table(pa.table(cols), str(pdir / "rank000.parquet"))
     with pytest.raises(RuntimeError, match=f"{col} has 1 null value"):
         merge_mod.run_merge(cfg)
+
+
+# ---------------------------------------------------------------------------
+# The device fold must agree with the host path, candidate for candidate.
+# ---------------------------------------------------------------------------
+
+def _rand_lists(rng, b, k, dup_ids=0, tie_frac=0.0):
+    """(scores, ids) ListArrays with controllable exact ties and duplicate ids."""
+    ids = [f"<urn:uuid:{i:08x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(b * k)]
+    if dup_ids:
+        for i in range(dup_ids):
+            ids[-(i + 1)] = ids[i]            # exact duplicate ids across rows
+    sc = rng.random(b * k).astype(np.float32)
+    if tie_frac:
+        n_t = int(b * k * tie_frac)
+        sc[:n_t] = np.float32(0.5)            # exact float32 ties
+    off = pa.array(np.arange(b + 1, dtype=np.int32) * k)
+    return (pa.ListArray.from_arrays(off, pa.array(sc, pa.float32())),
+            pa.ListArray.from_arrays(off, pa.array(ids, pa.large_string())))
+
+
+@pytest.mark.parametrize("n_inputs,b,k,dup,tie", [
+    (2, 40, 10, 0, 0.0),      # the ordinary 2-way fold
+    (2, 40, 10, 0, 0.35),     # heavy exact score ties -> ids decide
+    (2, 25, 8, 12, 0.5),      # duplicate ids AND ties: input order must decide
+    (1, 30, 12, 0, 0.0),      # the seed fold (n=1, width == k)
+    (4, 20, 6, 0, 0.25),      # multi-way
+])
+def test_the_device_fold_matches_the_host_fold_exactly(
+    monkeypatch, n_inputs, b, k, dup, tie
+):
+    """Same winners, same order, same scores — this is ground truth.
+
+    Both paths are driven over the SAME inputs and compared element-wise. The
+    device path skips the host candidate grid entirely, so a disagreement here
+    is a wrong top-K, not a performance difference.
+    """
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(11)
+    lists = [_rand_lists(rng, b, k, dup_ids=dup, tie_frac=tie)
+             for _ in range(n_inputs)]
+    scores = [s for s, _ in lists]
+    ids = [i for _, i in lists]
+
+    # `NOVA_BF_MERGE_FOLD=cpu` is the documented way to run the torch fold
+    # without a GPU; it makes `_fold_device()` hand back a CPU device, which
+    # is all the device path needs.
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+
+    # PROVE the device path ran. It DECLINES (returns None) on ragged rows or
+    # variable-width ids, and a decline routes the batch to the host path --
+    # so without this spy both sides of the comparison could be the same code
+    # and the test would pass while proving nothing.
+    took = []
+    real = merge_mod._dense_device_fold
+    monkeypatch.setattr(merge_mod, "_dense_device_fold",
+                        lambda *a, **kw: (lambda r: (took.append(r is not None), r)[1])(real(*a, **kw)))
+    dev_ids, dev_sc, dev_tie = merge_mod._topk_merge(scores, ids, None, k)
+    assert took == [True], f"the device fold did not run: {took}"
+
+    # Force the host path for the same inputs by refusing the dense fold.
+    monkeypatch.setattr(merge_mod, "_dense_device_fold", lambda *a, **kw: None)
+    host_ids, host_sc, host_tie = merge_mod._topk_merge(scores, ids, None, k)
+
+    assert dev_ids.to_pylist() == host_ids.to_pylist(), "winning ids differ"
+    assert dev_sc.to_pylist() == host_sc.to_pylist(), "winning scores differ"
+    assert dev_tie is None and host_tie is None
+
+
+def test_the_device_fold_declines_rows_shorter_than_k(monkeypatch):
+    """Ragged rows have no dense grid, so the fast path must DECLINE, not
+    guess. Returning None routes the batch to the general path; raising, or
+    silently reshaping, would corrupt the output for every sparse/filtered
+    search."""
+    torch = pytest.importorskip("torch")
+    b, k = 12, 5
+    lengths = np.full(b, k, dtype=np.int32)
+    lengths[3] = k - 2                              # one short row
+    off = pa.array(np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32))
+    total = int(lengths.sum())
+    sc = pa.ListArray.from_arrays(
+        off, pa.array(np.arange(total, dtype=np.float32), pa.float32()))
+    ids = pa.ListArray.from_arrays(
+        off, pa.array([f"<urn:uuid:{i:08x}-a-b-c-{i:012x}>" for i in range(total)],
+                      pa.large_string()))
+    assert merge_mod._dense_device_fold([sc], [ids], k, torch.device("cpu")) is None
+
+
+def test_the_device_fold_declines_variable_width_ids(monkeypatch):
+    """Without fixed-width ids there is no lane ranking, so no device grid."""
+    torch = pytest.importorskip("torch")
+    b, k = 10, 4
+    off = pa.array(np.arange(b + 1, dtype=np.int32) * k)
+    sc = pa.ListArray.from_arrays(
+        off, pa.array(np.arange(b * k, dtype=np.float32), pa.float32()))
+    ids = pa.ListArray.from_arrays(
+        off, pa.array([f"id{i}" for i in range(b * k)], pa.large_string()))
+    assert merge_mod._dense_device_fold([sc], [ids], k, torch.device("cpu")) is None
+
+
+@pytest.mark.parametrize("special,where,why", [
+    (float("-inf"), 3,  "-inf is how the general path marks PADDING, but a real "
+                        "score can be -inf too; the device path has no padding "
+                        "so it must not treat it as absent"),
+    (float("inf"),  5,  "+inf is a VALID hit and must survive the valid mask"),
+    (float("nan"),  7,  "NaN must sort BELOW every real candidate, matching the "
+                        "NumPy semantics `_fold_packed` forces with SENTINEL_KEY"),
+])
+def test_the_device_fold_handles_special_scores_like_the_host(
+    monkeypatch, special, where, why
+):
+    """Exactly the values where a dense fast path quietly disagrees."""
+    torch = pytest.importorskip("torch")
+    b, k, n = 16, 6, 2
+    rng = np.random.default_rng(5)
+    scores, ids = [], []
+    for w in range(n):
+        sc = rng.random(b * k).astype(np.float32)
+        sc[where::(b * k // 3 or 1)] = special      # sprinkle it across rows
+        off = pa.array(np.arange(b + 1, dtype=np.int32) * k)
+        scores.append(pa.ListArray.from_arrays(off, pa.array(sc, pa.float32())))
+        ids.append(pa.ListArray.from_arrays(off, pa.array(
+            [f"<urn:uuid:{w:04x}{i:04x}-aaaa-bbbb-cccc-{i:012x}>"
+             for i in range(b * k)], pa.large_string())))
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    took = []
+    real = merge_mod._dense_device_fold
+    monkeypatch.setattr(merge_mod, "_dense_device_fold",
+                        lambda *a, **kw: (lambda r: (took.append(r is not None), r)[1])(real(*a, **kw)))
+    d_ids, d_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
+    assert took == [True], "device fold did not run"
+
+    monkeypatch.setattr(merge_mod, "_dense_device_fold", lambda *a, **kw: None)
+    h_ids, h_sc, _ = merge_mod._topk_merge(scores, ids, None, k)
+
+    dv, hv = d_sc.to_pylist(), h_sc.to_pylist()
+    assert [len(r) for r in dv] == [len(r) for r in hv], f"hit COUNTS differ: {why}"
+    # NaN != NaN, so compare bit patterns rather than values.
+    assert ([np.asarray(r, dtype=np.float32).tobytes() for r in dv]
+            == [np.asarray(r, dtype=np.float32).tobytes() for r in hv]), why
+    assert d_ids.to_pylist() == h_ids.to_pylist(), why
+
+
+def test_the_device_fold_agrees_when_ids_repeat_inside_one_input(monkeypatch):
+    """Duplicate ids WITHIN a single input, not just across inputs.
+
+    Joint ranking gives equal ids equal lane values, so their relative order is
+    decided by the stable sort over position. The device path builds that
+    position mapping with a permute rather than a scatter, which is precisely
+    where an off-by-one would hide.
+    """
+    torch = pytest.importorskip("torch")
+    b, k = 20, 8
+    rng = np.random.default_rng(3)
+    pool = [f"<urn:uuid:{i:08x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(6)]
+    ids_flat = [pool[i % len(pool)] for i in range(b * k)]      # heavy repeats
+    sc = np.full(b * k, 0.25, dtype=np.float32)                 # everything ties
+    sc[::3] = rng.random(len(sc[::3])).astype(np.float32)
+    off = pa.array(np.arange(b + 1, dtype=np.int32) * k)
+    s_arr = pa.ListArray.from_arrays(off, pa.array(sc, pa.float32()))
+    i_arr = pa.ListArray.from_arrays(off, pa.array(ids_flat, pa.large_string()))
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    d = merge_mod._topk_merge([s_arr, s_arr], [i_arr, i_arr], None, k)
+    monkeypatch.setattr(merge_mod, "_dense_device_fold", lambda *a, **kw: None)
+    h = merge_mod._topk_merge([s_arr, s_arr], [i_arr, i_arr], None, k)
+    assert d[0].to_pylist() == h[0].to_pylist()
+    assert d[1].to_pylist() == h[1].to_pylist()
+
+
+def test_the_device_fold_handles_an_empty_batch(monkeypatch):
+    """A tail batch can have zero rows; `b == 0` must not reach torch at all."""
+    torch = pytest.importorskip("torch")
+    k = 4
+    off = pa.array(np.array([0], dtype=np.int32))
+    s_arr = pa.ListArray.from_arrays(off, pa.array([], pa.float32()))
+    i_arr = pa.ListArray.from_arrays(off, pa.array([], pa.large_string()))
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    ids, sc, tie = merge_mod._topk_merge([s_arr], [i_arr], None, k)
+    assert len(ids) == 0 and len(sc) == 0 and tie is None
+
+
+def _dense_pair(rng, b, k, seed):
+    off = pa.array(np.arange(b + 1, dtype=np.int32) * k)
+    sc = pa.array(rng.random(b * k).astype(np.float32), pa.float32())
+    ids = pa.array([f"<urn:uuid:{seed:04x}{i:04x}-aaaa-bbbb-cccc-{i:012x}>"
+                    for i in range(b * k)], pa.large_string())
+    return pa.ListArray.from_arrays(off, sc), pa.ListArray.from_arrays(off, ids)
+
+
+def test_the_device_fold_still_runs_once_the_state_carries_lanes(monkeypatch):
+    """THE SHAPE OF EVERY FOLD AFTER THE SEED: a lane-carrying state plus an
+    Arrow partial. The device path must TAKE it, not decline.
+
+    A guard for "mixed lane/Arrow inputs" -- commented "never happens today" --
+    declined exactly this, so the fast path ran once per batch and the other
+    ten folds took the host scatter path after building lanes they discarded.
+    Nothing caught it: the output stayed byte-identical and every test either
+    used an Arrow state or checked only the seed. The merge just ran 2x slower.
+
+    Asserting the RESULT is not enough here; the decline is invisible in the
+    answer. This asserts the path.
+    """
+    pytest.importorskip("torch")
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(4)
+    b, k = 14, 6
+
+    s0, i0 = _dense_pair(rng, b, k, 0)
+    lazy_ids, lazy_sc, _ = merge_mod._topk_merge([s0], [i0], None, k, lanes_mode=True)
+    assert isinstance(lazy_ids, merge_mod._LazyIds), "seed must produce lazy state"
+
+    took = []
+    real = merge_mod._dense_device_fold
+    monkeypatch.setattr(merge_mod, "_dense_device_fold",
+                        lambda *a, **kw: (lambda r: (took.append(r is not None), r)[1])(real(*a, **kw)))
+    s1, i1 = _dense_pair(rng, b, k, 1)
+    merge_mod._topk_merge([lazy_sc, s1], [lazy_ids, i1], None, k, lanes_mode=True)
+    assert took == [True], (
+        "the device fold DECLINED a lazy state + Arrow partial — that is every "
+        "fold after the seed, so the fast path would be effectively dead")
+
+
+def test_lazy_state_survives_a_batch_that_declines_the_device_fold(monkeypatch):
+    """The state carries LANES; the general path speaks Arrow. A batch that
+    declines must convert, not crash.
+
+    The device fold declines whenever any row is shorter than k, and real
+    partials contain queries that matched fewer than k documents. Caught only
+    on real data — every synthetic fixture had full rows, so the whole local
+    suite passed while the production merge died with
+    `'_LazyIds' object has no attribute 'flatten'`.
+    """
+    pytest.importorskip("torch")
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")
+    rng = np.random.default_rng(9)
+    b, k = 12, 5
+
+    s0, i0 = _dense_pair(rng, b, k, 0)
+    lazy_ids, lazy_sc, _ = merge_mod._topk_merge([s0], [i0], None, k, lanes_mode=True)
+    assert isinstance(lazy_ids, merge_mod._LazyIds)
+
+    lens = np.full(b, k, dtype=np.int32)
+    lens[4] = k - 3                                    # one ragged row
+    off2 = pa.array(np.concatenate([[0], np.cumsum(lens)]).astype(np.int32))
+    tot = int(lens.sum())
+    s1 = pa.ListArray.from_arrays(
+        off2, pa.array(rng.random(tot).astype(np.float32), pa.float32()))
+    i1 = pa.ListArray.from_arrays(off2, pa.array(
+        [f"<urn:uuid:ffff{i:04x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(tot)],
+        pa.large_string()))
+
+
+def _ragged_lists(lens, k, seed=0):
+    rng = np.random.default_rng(seed)
+    off = pa.array(np.concatenate([[0], np.cumsum(lens)]).astype(np.int32))
+    tot = int(np.sum(lens))
+    sc = pa.ListArray.from_arrays(
+        off, pa.array(rng.random(tot).astype(np.float32), pa.float32()))
+    ids = pa.ListArray.from_arrays(off, pa.array(
+        [f"<urn:uuid:{i:08x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(tot)],
+        pa.large_string()))
+    return sc, ids
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cpu"])
+def test_misaligned_id_rows_are_refused_on_every_fold_path(monkeypatch, backend):
+    """`hit_ids` split differently from `hit_scores` must RAISE, not mispair.
+
+    The guard lived inside the general path's scatter loop, so the device fast
+    path returned before it ran: scores [[3,2],[1,.5]] with ids [[u1],[u2,u3,u4]]
+    produced [[u1,u2],[u3,u4]] -- row 0's second hit carrying row 1's id. Wrong
+    ground truth, silently, and only on the fast path.
+    """
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", backend)
+    k = 2
+    sc, _ = _ragged_lists(np.array([2, 2], dtype=np.int32), k)
+    off_bad = pa.array(np.array([0, 1, 4], dtype=np.int32))
+    ids_bad = pa.ListArray.from_arrays(off_bad, pa.array(
+        [f"<urn:uuid:{i:08x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(4)],
+        pa.large_string()))
+    with pytest.raises(RuntimeError, match="split differently|wrong"):
+        merge_mod._topk_merge([sc], [ids_bad], None, k)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cpu"])
+def test_a_null_score_inside_a_list_is_refused_on_every_fold_path(monkeypatch, backend):
+    """A null score became NaN and was silently dropped by the `> -inf` mask on
+    the device path, so the query lost a hit instead of the merge refusing."""
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", backend)
+    k = 2
+    off = pa.array(np.array([0, 2, 4], dtype=np.int32))
+    sc = pa.ListArray.from_arrays(
+        off, pa.array([0.9, None, 0.7, 0.6], pa.float32()))
+    ids = pa.ListArray.from_arrays(off, pa.array(
+        [f"<urn:uuid:{i:08x}-aaaa-bbbb-cccc-{i:012x}>" for i in range(4)],
+        pa.large_string()))
+    with pytest.raises(RuntimeError, match="null"):
+        merge_mod._topk_merge([sc], [ids], None, k)
+
+
+# ---------------------------------------------------------------------------
+# The two merge-manifest layouts must not both describe the same parquet.
+# ---------------------------------------------------------------------------
+
+def _two_search_cfg(root: str) -> BruteForceConfig:
+    return BruteForceConfig(
+        corpus=CorpusConfig(path=f"{root}/corpus"),
+        queries=QueriesConfig(path=f"{root}/queries.parquet"),
+        output=OutputConfig(path=root),
+        searches=[SearchSpec(name="alpha", k=K), SearchSpec(name="beta", k=K)],
+    )
+
+
+def _manifest_paths(cfg, root):
+    from nova_bf import manifest as run_manifest
+
+    whole = root / run_manifest.manifest_name(cfg, "merge")
+    per = {s.name: root / run_manifest.manifest_name(cfg, "merge", search=s.name)
+           for s in cfg.searches}
+    return whole, per
+
+
+def test_a_manifest_that_vanishes_mid_delete_is_not_reported_as_a_failure(
+        tmp_path, monkeypatch, caplog):
+    """Under `--jobs` every child deletes the same whole-run manifest.
+
+    All but one lose the race between `get_file_info` and `delete_file` and see
+    `FileNotFoundError`. The broad `except` logged "it may describe a run that is
+    no longer on disk" -- alarming, and false: the file was correctly removed.
+    """
+    root = tmp_path / "out"
+    root.mkdir(parents=True)
+    victim = root / "_bf_manifest_gone_merge.json"
+    victim.write_text("{}")
+    out = Store(str(root))
+
+    class RacingFS:
+        # pyarrow filesystem methods are read-only, so wrap rather than patch.
+        def __init__(self, inner):
+            self._inner = inner
+
+        def get_file_info(self, path):
+            return self._inner.get_file_info(path)
+
+        def delete_file(self, path):
+            self._inner.delete_file(path)
+            raise FileNotFoundError(path)      # as if a sibling got there first
+
+    out.fs = RacingFS(out.fs)
+
+    with caplog.at_level("WARNING"):
+        merge_mod._drop_manifests(out, ["_bf_manifest_gone_merge.json"], "why")
+    assert not victim.exists()
+    assert caplog.records == []
+
+
+# ---------------------------------------------------------------------------
+# Round 3: the probe, the failed-write cleanup, and manifest coverage.
+# ---------------------------------------------------------------------------
+
+def test_the_density_probe_sees_every_row_not_just_the_first_batch(
+        tmp_path, monkeypatch, caplog):
+    """`dense` is a MINIMUM over rows, so a partial prefix cannot decide it.
+
+    Probing only the first batch was strictly optimistic: rows 0..1499 full-k
+    with 1500+ short probed `dense=True`, turning `lanes_mode` on for exactly
+    the filtered-search shape the density gate was added to keep it off. That
+    costs a materialise() and a _lazy_from_arrow() per fold -- ~235 MB each way
+    at the real shape -- for a fast path that then never runs. Perf, not
+    correctness, but it silently undoes the gate.
+    """
+    monkeypatch.setenv("NOVA_BF_MERGE_FOLD", "cpu")   # the probe needs a device
+    root = tmp_path / "out"
+    cfg = _cfg(str(root))
+    pdir = root / partial_dir(cfg, cfg.searches[0])
+    pdir.mkdir(parents=True)
+
+    # PAST THE PROBE BATCH. `probe_rows` is
+    # `max(256, min(8192, 2_000_000 // k))`, which at k=4 is 8192 -- so a
+    # 2000-row fixture is ONE batch and the first-batch-only probe it is meant
+    # to catch gets the same answer as the streaming one. Verified: at
+    # n_full=1500 both say `arrow`; at n_full=9000 the unfixed probe says
+    # `device lanes` and the fixed one says `arrow`.
+    n_full, n_short = 9000, 500
+    qids = [f"q{i}" for i in range(n_full + n_short)]
+    ids, scores = [], []
+    for i, q in enumerate(qids):
+        width = K if i < n_full else 1
+        ids.append([f"<urn:uuid:{i:08x}-{j:04x}>" for j in range(width)])
+        scores.append([1.0 - j * 0.01 for j in range(width)])
+    for p in range(2):
+        pq.write_table(build_result_table(qids, {}, ids, scores),
+                       str(pdir / f"rank{p:03d}.parquet"))
+
+    with caplog.at_level("INFO"):
+        merge_mod.run_merge(cfg)
+    log = caplog.text
+    assert "partial rows are not all k=" in log, (
+        "the probe called a partial dense whose later rows are short")
+    assert "merge state ids: arrow" in log, log[-2000:]
+
+
+@pytest.mark.parametrize("scheme", ["local", "s3"])
+def test_a_failed_write_removes_the_truncated_output_on_every_store(
+        tmp_path, monkeypatch, scheme):
+    """S3 is NOT special here, though this module long believed it was.
+
+    Measured against a real S3 API (MinIO) with pyarrow's own
+    `open_output_stream`: writing a partial payload and calling close() COMMITS
+    it -- at 1 MB (single PutObject) and at 12 MB (multipart), over a previous
+    object as readily as onto a fresh key, and even when the stream is merely
+    abandoned. `sink.close()` in the merge's `finally` IS the commit and it runs
+    unconditionally, so a failed merge leaves a truncated parquet under the
+    canonical name on every store. Skipping the delete for S3 left it there, and
+    the message told the operator the previous object was intact when it had in
+    fact just been overwritten.
+    """
+    if scheme == "s3":
+        fake_s3 = tmp_path / "s3root"
+        fake_s3.mkdir()
+        real_fs = io_mod._fs_and_path
+
+        def fake_fs_and_path(uri: str):
+            if uri.startswith("s3://"):
+                return (pafs.SubTreeFileSystem(str(fake_s3),
+                                               pafs.LocalFileSystem()),
+                        uri[len("s3://"):])
+            return real_fs(uri)
+
+        monkeypatch.setattr(io_mod, "_fs_and_path", fake_fs_and_path)
+        cfg = _cfg("s3://bucket/prefix")
+        root = fake_s3 / "bucket" / "prefix"
+    else:
+        cfg = _cfg(str(tmp_path / "out"))
+        root = tmp_path / "out"
+
+    assert Store(cfg.output.path).is_s3 is (scheme == "s3")
+
+    cfg.params.merge_batch_size = 2
+    _write_partials(cfg, root / partial_dir(cfg, cfg.searches[0]),
+                    n_partials=2, n_queries=8)
+    out_path = root / result_name(cfg, cfg.searches[0])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(b"PREVIOUS GOOD RESULT")
+
+    real = pq.ParquetWriter.write_table
+    state = {"n": 0}
+
+    def flaky(self, table, *a, **kw):
+        state["n"] += 1
+        if state["n"] == 2:                   # first batch lands, second dies
+            raise OSError("object store went away mid-write")
+        return real(self, table, *a, **kw)
+
+    monkeypatch.setattr(pq.ParquetWriter, "write_table", flaky)
+    with pytest.raises(OSError, match="went away"):
+        merge_mod.run_merge(cfg)
+    assert not out_path.exists(), (
+        f"{scheme}: a truncated result was left under the canonical output name")
+
+
+
+@contextlib.contextmanager
+def caplog_at(level):
+    """A logging capture that works inside `pytest.raises`."""
+    import logging
+
+    class Sink(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+        @property
+        def text(self):
+            return "\n".join(r.getMessage() % () if not r.args else
+                              r.getMessage() for r in self.records)
+
+    sink = Sink()
+    sink.setLevel(level)
+    log = logging.getLogger("nova_bf.merge")
+    log.addHandler(sink)
+    try:
+        yield sink
+    finally:
+        log.removeHandler(sink)
+
+
+# ---------------------------------------------------------------------------
+# Round 4: whether the COMMIT ran decides what survives, not whether an object
+# was there before.
+# ---------------------------------------------------------------------------
+
+class _CloseFailsFS(pafs.FileSystemHandler):
+    """A real pyarrow filesystem whose OUTPUT STREAM fails to close.
+
+    A Python proxy will not do: the merge hands `out.fs` to `pq.ParquetFile`,
+    which requires a genuine `FileSystem`. `PyFileSystem` over a handler is the
+    only way to intercept `open_output_stream` and still be one.
+    """
+
+    def __init__(self, root):
+        self._fs = pafs.SubTreeFileSystem(str(root), pafs.LocalFileSystem())
+
+    def get_type_name(self):
+        return "closefails"
+
+    def __eq__(self, other):
+        return isinstance(other, _CloseFailsFS) and other._fs == self._fs
+
+    def get_file_info(self, paths):
+        return self._fs.get_file_info(paths)
+
+    def get_file_info_selector(self, selector):
+        return self._fs.get_file_info(selector)
+
+    def create_dir(self, path, recursive=True):
+        self._fs.create_dir(path, recursive=recursive)
+
+    def delete_dir(self, path):
+        self._fs.delete_dir(path)
+
+    def delete_dir_contents(self, path, missing_dir_ok=False):
+        self._fs.delete_dir_contents(path, missing_dir_ok=missing_dir_ok)
+
+    def delete_root_dir_contents(self):
+        self._fs.delete_dir_contents("", accept_root_dir=True)
+
+    def delete_file(self, path):
+        self._fs.delete_file(path)
+
+    def move(self, src, dest):
+        self._fs.move(src, dest)
+
+    def copy_file(self, src, dest):
+        self._fs.copy_file(src, dest)
+
+    def open_input_stream(self, path):
+        return self._fs.open_input_stream(path)
+
+    def open_input_file(self, path):
+        return self._fs.open_input_file(path)
+
+    def open_append_stream(self, path, metadata=None):
+        return self._fs.open_append_stream(path, metadata=metadata)
+
+    def normalize_path(self, path):
+        return path
+
+    def open_output_stream(self, path, metadata=None):
+        import io
+
+        class NoCommit(io.BytesIO):
+            # NOTHING REACHES THE STORE. Writes go to a buffer that is thrown
+            # away, because on real S3 an upload whose close() fails commits
+            # nothing -- measured, the previous object survives at its original
+            # size. Writing through to the local stand-in instead would
+            # truncate it at open, and the test could then no longer tell
+            # "correctly left the previous result alone" from "left a
+            # truncated write behind".
+            def close(self):
+                raise OSError("object store went away during commit")
+
+        return pa.PythonFile(NoCommit(), mode="w")
+
+
+def test_an_s3_merge_that_fails_to_commit_keeps_the_previous_result(
+        tmp_path, monkeypatch):
+    """`sink.close()` raising on S3 means NOTHING was uploaded -- do not delete.
+
+    Measured against a real S3 API (MinIO), writing a partial payload and then
+    taking the store away so the commit fails:
+
+        1 MB  over a previous 2 KB object -> close() RAISED -> previous, 2 KB
+        12 MB over a previous 2 KB object -> close() RAISED -> previous, 2 KB
+        1 MB  onto a fresh key            -> close() RAISED -> still NotFound
+
+    An object-store outage fails the body AND the commit together, which is the
+    commonest merge failure at the 153 GB shape. Deleting there destroys a
+    finished ground-truth artifact this run never overwrote -- and if the delete
+    itself then fails, tells the operator to remove it by hand.
+    """
+    fake_s3 = tmp_path / "s3root"
+    fake_s3.mkdir()
+    handler = _CloseFailsFS(fake_s3)
+    real_fs = io_mod._fs_and_path
+
+    def fake_fs_and_path(uri: str):
+        if uri.startswith("s3://"):
+            return pafs.PyFileSystem(handler), uri[len("s3://"):]
+        return real_fs(uri)
+
+    monkeypatch.setattr(io_mod, "_fs_and_path", fake_fs_and_path)
+    cfg = _cfg("s3://bucket/prefix")
+    root = fake_s3 / "bucket" / "prefix"
+    _write_partials(cfg, root / partial_dir(cfg, cfg.searches[0]), n_partials=2)
+
+    out_path = root / result_name(cfg, cfg.searches[0])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(b"PREVIOUS GOOD RESULT" * 100)
+
+    with pytest.raises(OSError, match="went away"), caplog_at("ERROR") as log:
+        merge_mod.run_merge(cfg)
+
+    assert out_path.exists(), (
+        "the merge deleted the output key although the commit never ran")
+    assert out_path.read_bytes() == b"PREVIOUS GOOD RESULT" * 100, (
+        "the previous, valid result was not left byte-for-byte intact")
+    assert "before committing" in log.text
+    assert "removed the incomplete" not in log.text
+
+
+def test_a_footer_failure_is_not_an_uncommitted_upload(tmp_path, monkeypatch):
+    """`writer.close()` and `sink.close()` are different events.
+
+    Folding both into one `close_err` made a FOOTER failure look like an
+    uncommitted upload. Measured against MinIO with the footer write
+    interrupted: the sink still committed -- a 2982-byte non-parquet over a
+    previous 2048-byte result -- and the merge declined to delete it AND told
+    the operator the object there was the previous one, intact. Its mtime is
+    fresh, so the check the message asks for confirms the lie.
+    """
+    fake_s3 = tmp_path / "s3root"
+    fake_s3.mkdir()
+    real_fs = io_mod._fs_and_path
+
+    def fake_fs_and_path(uri: str):
+        if uri.startswith("s3://"):
+            return (pafs.SubTreeFileSystem(str(fake_s3), pafs.LocalFileSystem()),
+                    uri[len("s3://"):])
+        return real_fs(uri)
+
+    monkeypatch.setattr(io_mod, "_fs_and_path", fake_fs_and_path)
+    cfg = _cfg("s3://bucket/prefix")
+    root = fake_s3 / "bucket" / "prefix"
+    _write_partials(cfg, root / partial_dir(cfg, cfg.searches[0]), n_partials=2)
+    out_path = root / result_name(cfg, cfg.searches[0])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(b"PREVIOUS GOOD RESULT" * 100)
+
+    def bad_footer(self, *a, **kw):
+        raise KeyboardInterrupt("interrupted writing the footer")
+
+    monkeypatch.setattr(pq.ParquetWriter, "close", bad_footer)
+
+    with pytest.raises(BaseException), caplog_at("ERROR") as log:
+        merge_mod.run_merge(cfg)
+
+    assert not out_path.exists(), (
+        "a footerless object was committed and left under the canonical name")
+    assert "removed the incomplete" in log.text
+
+
+
+
+
+def test_a_failed_merge_removes_its_search_manifest_with_its_output(tmp_path):
+    """A manifest for a parquet that is not there reads as complete.
+
+    With one manifest per search, an EARLIER merge's record for this search is
+    still on the prefix and it names the file the failure path just deleted.
+    The two have to go together.
+    """
+    from nova_bf import manifest as run_manifest
+
+    root = tmp_path / "out"
+    cfg = _cfg(str(root))
+    cfg.params.merge_batch_size = 2
+    _write_partials(cfg, root / partial_dir(cfg, cfg.searches[0]),
+                    n_partials=2, n_queries=8)
+    merge_mod.run_merge(cfg)                       # a good run, with a manifest
+    man = root / run_manifest.manifest_name(cfg, "merge", search="test")
+    out_path = root / result_name(cfg, cfg.searches[0])
+    assert man.exists() and out_path.exists()
+
+    real = pq.ParquetWriter.write_table
+    state = {"n": 0}
+
+    def flaky(self, table, *a, **kw):
+        state["n"] += 1
+        if state["n"] == 2:                        # first batch lands, second dies
+            raise OSError("object store went away mid-write")
+        return real(self, table, *a, **kw)
+
+    import unittest.mock as _mock
+    with _mock.patch.object(pq.ParquetWriter, "write_table", flaky):
+        with pytest.raises(OSError, match="went away"):
+            merge_mod.run_merge(cfg)
+
+    assert not out_path.exists(), "a truncated result was left behind"
+    assert not man.exists(), (
+        "the manifest outlived the output it describes, so the prefix now "
+        "reads as a completed merge")

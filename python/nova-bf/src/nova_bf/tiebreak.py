@@ -1,39 +1,38 @@
 """Deterministic tie-breaking for top-K selection.
 
-`torch.topk` does not define the order of EXACTLY equal scores, so tied results
-can change with batching, tiling, worker count, or device. To make selection
-deterministic, each candidate is assigned one packed `int64` key:
+`torch.topk` does not define the order of exactly equal scores, so tied results
+may vary with batching, tiling, worker count, or device. Each candidate is
+therefore assigned a packed `int64` key:
 
     packed = score_order_key(score) * 2**32 + (0xFFFFFFFF - ordinal)
 
-The high 32 bits contain a lossless, order-preserving encoding of the float32
-score. The low 32 bits contain the inverted ordinal, so `topk`-largest selects
-the smallest ordinal when scores tie. Because the score transform is bijective,
-`unpack_score` recovers the original score bit-for-bit.
+The high 32 bits preserve float32 score order; the low 32 bits contain the
+inverted ordinal, so larger keys prefer higher scores and then lower ordinals.
+`unpack_score` recovers the original non-NaN score exactly, except that `-0.0`
+is normalized to `+0.0`.
 
 ORDINALS
 --------
-Each row owned by a worker gets a dense ordinal in `[0, n_rows)`:
+Each row owned by a worker receives an ordinal in `[0, n_rows)`:
 
-  ordinal   position in corpus order.
-  id        position in sorted-ID order, so the lowest ID wins ties.
+  ordinal   position in corpus order
+  id        position in sorted-ID order
 
-Ordinals are worker-local. They only need to preserve the requested order among
-that worker's rows. Cross-worker ties are resolved later by `merge` using the
-full ID, or `hit_tie` for numeric IDs.
+Ordinals are worker-local. Cross-worker ties are resolved during merge using
+the full ID, or `hit_tie` for numeric IDs.
 
 WHY RANK IDS
 ------------
-IDs themselves may be too large to fit in the key. Instead, `id` tie-breaking
-uses each ID's rank in sorted order. This preserves exact ordering regardless
-of whether the ID is a UUID, integer, or string, while keeping the tie value
-within 32 bits.
+IDs may not fit in the packed key, so `id` tie-breaking uses their rank in
+sorted order. This preserves ID ordering while keeping the tie value within
+32 bits.
 
 REPRODUCIBILITY
 ---------------
-This only resolves scores that are bit-for-bit equal. Changing matmul batching
-or tiling can change a score by an ULP and therefore change whether a tie
-exists. Pin the batch size when bit-reproducible output is required.
+Tie-breaking only resolves bit-for-bit equal scores. Changes to scoring
+batching, tiling, or arithmetic may change a score by an ULP and therefore
+change whether a tie exists. Pin the execution configuration when
+bit-reproducible output is required.
 """
 
 from __future__ import annotations
@@ -275,6 +274,8 @@ _MAX_FIXED_WIDTH = 64
 # Testing shows that four parse threads performs best; additional 
 # threads add contention.
 _PARSE_WORKERS = 4
+# Order-preserving unsigned->signed flip, as an int64 (== numpy's uint64 1<<63).
+_INT64_SIGN = -(1 << 63)
 # GPU permutations use signed int32 indices; larger ranks fall back to CPU.
 _MAX_INT32_ROWS = 2**31 - 1
 
@@ -348,6 +349,120 @@ def _pack_lanes(chunks: list, W: int, total: int, workers: int) -> np.ndarray:
         # An allocating conversion would duplicate this potentially large array.
         lanes.byteswap(inplace=True)
     return lanes
+
+def _lanes_on_device(chunks: list, W: int, total: int, dev):
+    """Build `(total, nlanes)` int64 sort keys directly on `dev`.
+
+    Produces the same big-endian, zero-padded, sign-flipped lane representation
+    as `_pack_lanes`, without materializing the packed lanes on the host.
+    """
+    import torch
+
+    nlanes = (W + 7) // 8
+
+    # Zero initialization supplies the required right padding.
+    raw = torch.zeros((total, nlanes * 8), dtype=torch.uint8, device=dev)
+
+    off = 0
+    for c in chunks:
+        n = len(c)
+        if n:
+            # Arrow character buffers need an owned writable copy for Torch.
+            host = torch.from_numpy(_byte_rows(c, W).copy())
+            raw[off : off + n, :W] = host.to(dev, non_blocking=True)
+        off += n
+
+    # Reverse each 8-byte group into big-endian numeric lane order.
+    lanes = (
+        raw.view(total, nlanes, 8)
+        .flip(-1)
+        .contiguous()
+        .view(torch.int64)
+        .squeeze(-1)
+    )
+    del raw
+
+    # Preserve unsigned ordering in signed int64.
+    return lanes ^ _INT64_SIGN
+
+
+def _gpu_perm_from_lanes(lanes) -> "np.ndarray":
+    """Return the lexicographic permutation of device-resident ID lanes.
+
+    Stable sorts are applied from least- to most-significant lane, and constant
+    lanes are skipped because they cannot affect the ordering.
+    """
+    import torch
+
+    total, nlanes = lanes.shape
+
+    # int32 indices reduce permutation memory and are supported by index_select.
+    perm = torch.arange(total, dtype=torch.int32, device=lanes.device)
+
+    for j in range(nlanes - 1, -1, -1):
+        col = lanes[:, j].contiguous()
+
+        # A stable sort by a constant lane is a no-op.
+        if bool((col == col[0]).all()):
+            continue
+
+        key = torch.index_select(col, 0, perm)
+        del col
+
+        idx = torch.argsort(key, stable=True)
+        del key
+
+        perm = torch.index_select(perm, 0, idx.to(torch.int32))
+        del idx
+
+    out = perm.cpu().numpy()
+    del perm
+    return out
+
+def ids_from_lanes(lanes, W: int) -> pa.Array:
+    """Convert fixed-width ID lanes back to an Arrow `large_string` array.
+
+    This reverses the sign flip and byte order used by `_lanes_on_device`,
+    then removes right-padding to recover the original W-byte IDs.
+    """
+    import torch
+
+    n, nlanes = lanes.shape
+
+    if n == 0:
+        # Avoid invalid uint8 views for empty single-lane tensors.
+        return pa.Array.from_buffers(
+            pa.large_string(),
+            0,
+            [
+                None,
+                pa.py_buffer(np.zeros(1, dtype=np.int64)),
+                pa.py_buffer(b""),
+            ],
+        )
+
+    raw = (
+        (lanes ^ _INT64_SIGN)
+        .view(torch.uint8)
+        .view(n, nlanes, 8)
+        .flip(-1)
+        .reshape(n, nlanes * 8)[:, :W]
+        .contiguous()
+    )
+
+    # Wrap the contiguous NumPy buffer directly to avoid another full copy.
+    data = raw.cpu().numpy().reshape(-1)
+    offsets = np.arange(n + 1, dtype=np.int64) * W
+
+    return pa.Array.from_buffers(
+        pa.large_string(),
+        n,
+        [
+            None,
+            pa.py_buffer(offsets),
+            pa.py_buffer(data),
+        ],
+    )
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -562,9 +677,32 @@ def build_ordinals(id_arrays: list) -> list[np.ndarray]:
         if W is not None:
             nlanes = (W + 7) // 8
             mode = _gpu_mode(total)
+            # Prefer device-built lanes in 64-bit mode to avoid host packing.
+            # Mode 32 is already memory-constrained, so use the host path instead.
+            # Device OOM falls back to host packing.
+            if mode == 64:
+                try:
+                    import torch
+                    lanes_d = _lanes_on_device(arrays, W, total,
+                                               torch.device("cuda"))
+                    try:
+                        perm = _gpu_perm_from_lanes(lanes_d)
+                    finally:
+                        del lanes_d
+                except Exception as exc:
+                    if not _is_oom(exc):
+                        raise
+                    logger.warning(
+                        "tiebreak='id': building lanes on the device ran out "
+                        "of memory (%s); packing on the host instead", exc)
+                    try:
+                        import torch
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
             if mode is not None and not _host_can_pack(total, nlanes):
                 mode = None
-            if mode is not None:
+            if perm is None and mode is not None:
                 lanes = _pack_lanes(arrays, W, total, _PARSE_WORKERS)
                 # Re-check AFTER packing.
                 again = _gpu_mode(total)

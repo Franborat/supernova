@@ -319,21 +319,26 @@ def test_sharded_run_writes_one_manifest_per_rank_and_a_merge_manifest(ds, tmp_p
     assert sum(d["counts"]["corpus_rows_scanned"] for d in per_rank) == 9
 
     run_merge(cfg)
-    doc = _read(out / "_bf_manifest_queries_merge.json")
-    assert doc["phase"] == "merge"
-    assert doc["counts"]["partials_merged"] == num_jobs * len(cfg.searches)
-    assert doc["counts"]["queries"] == 4
-    # Merge never opens the corpus, so it has no file list to fingerprint —
-    # the compute manifests own that, and `partial_dir` traces back to them.
-    assert "fingerprint" not in doc["source"]["corpus"]
-    by_name = {s["name"]: s for s in doc["searches"]}
+    # ONE MANIFEST PER SEARCH, always -- there is no run-level merge manifest.
+    assert not (out / "_bf_manifest_queries_merge.json").exists()
+    by_name = {}
+    for spec in cfg.searches:
+        doc = _read(out / f"_bf_manifest_queries_merge/{spec.name}.json")
+        assert doc["phase"] == "merge"
+        assert doc["counts"]["partials_merged"] == num_jobs
+        assert doc["counts"]["queries"] == 4
+        # Merge never opens the corpus, so it has no file list to fingerprint —
+        # the compute manifests own that, and `partial_dir` traces back to them.
+        assert "fingerprint" not in doc["source"]["corpus"]
+        assert [e["name"] for e in doc["searches"]] == [spec.name]
+        by_name[spec.name] = doc["searches"][0]
+        for name in doc["output_files"]:
+            assert (out / name).exists()
     assert by_name["eng"]["partials"] == num_jobs
     assert by_name["eng"]["filter"]["must"][0]["match"] == "eng"
     # Storage dtypes are carried off the partials, not re-derived from a corpus
     # merge never opens.
     assert by_name["eng"]["corpus_dtype"] == "float32"
-    for name in doc["output_files"]:
-        assert (out / name).exists()
 
 
 def test_manifest_failure_does_not_fail_the_run(ds, tmp_path, monkeypatch, caplog):

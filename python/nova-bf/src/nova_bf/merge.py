@@ -40,12 +40,14 @@ from nova_bf.io import ParquetFile, Store
 from nova_bf.tiebreak import SENTINEL_KEY, build_ordinals
 from nova_bf.results import (
     CONFIG_KEY,
+    FORCED_KEY,
     JOB_RANK_KEY,
     NUM_JOBS_KEY,
     RESERVED,
     RUN_KEY,
     TIEBREAK_KEY,
     config_identity,
+    merge_forced,
     partial_dir,
     provenance,
     result_name,
@@ -54,104 +56,55 @@ from nova_bf.results import (
 
 logger = logging.getLogger(__name__)
 
-# Bound in-flight partial memory as a fraction of currently available RAM.
-_MERGE_WINDOW_FRACTION = 0.35
-_MERGE_WINDOW_MIN = 2
-_MERGE_WINDOW_MAX = 16
-_MERGE_WINDOW_FALLBACK_BYTES = 8 << 30
+# How many partials may be read into memory at once. TWO gives read/fold
+# overlap -- one being folded while the next arrives -- which is the whole
+# point of the window; one makes the merge strictly sequential.
+_MERGE_WINDOW_DEFAULT = 2
+# Concurrent range GETs per in-flight partial are this divided by the window,
+# because `_ranged_download` builds its own pool PER FILE.
+_RANGED_GET_POOL = 24
 
-# Estimate parsed Arrow size from Parquet metadata; dictionary-encoded columns
-# expand more when materialized.
-_PARSE_EXPANSION_DICT = 3.5
-_PARSE_EXPANSION_PLAIN = 1.3
+def _merge_window(cfg, n_partials: int) -> int:
+    """Return the number of partials to keep in flight.
 
+    NOVA_BF_MERGE_WINDOW overrides params.merge_window; invalid values fall
+    back to the config before the default.
+    """
+    assert n_partials >= 1
 
-def _hit_bytes_per_partial(readers: list[pq.ParquetFile], hit_cols: list[str],
-                           ranged: bool = False) -> int:
-    """Uncompressed bytes ONE partial's hit columns occupy once parsed."""
-    worst = 0
-    for r in readers:
-        md = r.metadata
-        hit = raw = 0
-        for g in range(md.num_row_groups):
-            rg = md.row_group(g)
-            for c in range(rg.num_columns):
-                col = rg.column(c)
-                raw += col.total_compressed_size          # ~ the file on disk
-                # nested columns appear as leaf paths ("hit_ids.list.element")
-                if col.path_in_schema.split(".")[0] in hit_cols:
-                    enc = getattr(col, "encodings", None)
-                    dictish = (True if enc is None
-                               else any("DICT" in str(e).upper() for e in enc))
-                    by_encoding = col.total_uncompressed_size * (
-                        _PARSE_EXPANSION_DICT if dictish else _PARSE_EXPANSION_PLAIN)
-                    
-                    # Use the larger metadata- or statistics-based estimate.
-                    hit += max(by_encoding, _string_parsed_bytes(col) or 0)
-        n = int(hit)
-        if ranged:
-            # Ranged reads also keep the full encoded file in memory.
-            n += raw
-        worst = max(worst, n)
-    return worst
+    want = None
+    raw = os.environ.get("NOVA_BF_MERGE_WINDOW", "").strip()
 
+    if raw:
+        try:
+            want = int(raw)
+        except ValueError:
+            want = None
 
-def _string_parsed_bytes(col) -> int | None:
-    """Estimate parsed bytes for a fixed-width string column from statistics."""
-    try:
-        st = col.statistics
-        if st is None or not st.has_min_max:
-            return None
-        lo, hi = st.min, st.max
-        if not isinstance(hi, (str, bytes)) or not isinstance(lo, (str, bytes)):
-            return None
-        # Only fixed-width strings can be estimated safely from min/max.
-        if len(lo) != len(hi):
-            return None
-        # large_string = character bytes + one int64 offset per value
-        return int(col.num_values) * (len(hi) + 8)
-    except Exception:
-        # Statistics are optional; fall back to the encoding-based estimate.
-        return None
+        if want is not None and want < 1:
+            want = None
 
+        if want is None:
+            logger.warning(
+                "NOVA_BF_MERGE_WINDOW=%r is not a positive integer; using "
+                "params.merge_window instead",
+                raw,
+            )
 
-def _merge_window(readers: list[pq.ParquetFile], hit_cols: list[str],
-                  n_partials: int, ranged: bool = False) -> int:
-    """How many partials may be in flight, from a byte budget."""
-    avail = _MERGE_WINDOW_FALLBACK_BYTES
-    try:
-        with open("/proc/meminfo") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    avail = int(line.split()[1]) * 1024
-                    break
-    except OSError:
-        pass
-    per = _hit_bytes_per_partial(readers, hit_cols, ranged)
-    if per <= 0:
-        logger.warning(
-            "merge window: parquet metadata reported no bytes for %s — cannot "
-            "size the window; using the %d-partial floor blind.",
-            hit_cols, _MERGE_WINDOW_MIN,
-        )
-        return min(_MERGE_WINDOW_MIN, n_partials)
-    budget = int(avail * _MERGE_WINDOW_FRACTION)
-    fits = budget // per
-    # Prefer the overlap floor when affordable, but never exceed the budget cap.
-    n = min(max(fits, 1 if fits < _MERGE_WINDOW_MIN else _MERGE_WINDOW_MIN),
-            _MERGE_WINDOW_MAX, n_partials)
-    if fits < _MERGE_WINDOW_MIN:
-        logger.warning(
-            "merge window: one partial (%.2f GiB of hit columns) exceeds the "
-            "%.1f GiB budget; dropping to %d reader(s) — no read/fold overlap, "
-            "but a deeper window would only multiply the overshoot. Merge on a "
-            "larger box if this still OOMs.",
-            per / 2**30, budget / 2**30, n,
-        )
+    if want is None:
+        want = getattr(getattr(cfg, "params", None), "merge_window", None)
+
+    if not (isinstance(want, int) and not isinstance(want, bool) and want >= 1):
+        want = _MERGE_WINDOW_DEFAULT
+
+    # More readers than partials only dilute the shared range-GET pool.
+    n = min(want, n_partials)
+
     logger.info(
-        "merge window: %d partial(s) in flight (%.2f GiB each x %d = %.1f GiB "
-        "against %.1f GiB available)",
-        n, per / 2**30, n, n * per / 2**30, avail / 2**30,
+        "merge window: %d partial(s) in flight%s",
+        n,
+        "" if n == want
+        else f" (requested {want}, clamped to the {n_partials} partial(s) present)",
     )
     return n
 
@@ -557,6 +510,21 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
     `merge_ranged_reads` enables concurrent ranged fetches into memory; nothing
     is staged to local disk.
     """
+    # Resolve the force flag ONCE, before any I/O, and thread the boolean from
+    # here.
+    forced = merge_forced(cfg)
+    if forced:
+        logger.error(
+            "MERGE FORCED: every provenance check below is advisory. Partials "
+            "will be merged even if they come from different runs, a different "
+            "config, a different tie-break rule, or an incomplete rank set. "
+            "The output is stamped nova_bf.merge_forced=true and is NOT "
+            "verified ground truth. DOUBLE COVERAGE is still refused -- a "
+            "repeated rank, a rank out of range, an unstamped partial beside "
+            "stamped ones, or partials disagreeing about num_jobs: those are "
+            "provably wrong output, not merely unverified output."
+        )
+
     out = Store(cfg.output.path)
 
     partials_by_name: dict[str, list[ParquetFile]] = {}
@@ -573,7 +541,7 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
     if len(partials_by_name) > 1:
         counts = {name: len(partials) for name, partials in partials_by_name.items()}
         if len(set(counts.values())) > 1:
-            raise RuntimeError(
+            _refuse(forced, "<all>",
                 f"searches have mismatched partial counts: {counts} — every search in "
                 "one `compute` run should have the same number of per-rank partials; "
                 "this points to a rank that died partway through writing its per-search "
@@ -602,16 +570,19 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
     seen = {v for vs in rules.values() for v in vs if v is not None}
     if len(seen) > 1:
         pretty = {n: sorted(x.decode() for x in v if x) for n, v in rules.items()}
-        raise RuntimeError(
+        _refuse(forced, "<all>",
             f"partials were computed under different tie-break rules: {pretty} — "
             "merging them puts hits decided by different rules in one artifact. "
             "Re-run `bf compute` so every search uses one `params.tiebreak`."
         )
 
     entries = [
-        _reduce(cfg, spec, out, partials_by_name[spec.name], readers_by_name[spec.name])
+        _reduce(cfg, spec, out, partials_by_name[spec.name],
+                readers_by_name[spec.name], forced)
         for spec in cfg.searches
     ]
+    # `forced` covers THIS merge
+    any_forced = forced or any(e.get("merge_forced") for e in entries)
 
     # Record the completed reduce and the number of partials actually folded.
     doc = run_manifest.base_manifest(cfg, "merge")
@@ -623,10 +594,35 @@ def run_merge(cfg: BruteForceConfig) -> dict[str, str]:
             "queries": max((e["queries"] for e in entries), default=0),
         },
         "timing": {"elapsed_seconds": round(time.perf_counter() - t0, 2)},
+        **({"merge_forced": True} if any_forced else {}),
         "output_files": [e["output_file"] for e in entries],
     })
     run_manifest.write(out, run_manifest.manifest_name(cfg, "merge"), doc)
     return {e["name"]: e["output_path"] for e in entries}
+
+# --- recorded escape hatch for merge provenance checks ------------------------
+
+def _refuse(forced: bool, spec_name: str, message: str) -> None:
+    """Raise unless this merge was explicitly forced."""
+    if not forced:
+        raise RuntimeError(message)
+
+    logger.error(
+        "MERGE CHECK FORCED for search=%r. The merge would otherwise have "
+        "refused: %s This artifact is stamped nova_bf.merge_forced=true and "
+        "is NOT verified ground truth.",
+        spec_name,
+        message,
+    )
+
+
+def _inputs_forced(readers: list[pq.ParquetFile]) -> bool:
+    """Return whether any input was produced by a forced merge."""
+    return any(
+        (r.schema_arrow.metadata or {}).get(FORCED_KEY) == b"true"
+        for r in readers
+    )
+
 
 
 def _validate_one_run(
@@ -634,148 +630,248 @@ def _validate_one_run(
     spec: SearchSpec,
     partials: list[ParquetFile],
     readers: list[pq.ParquetFile],
+    forced: bool = False,
 ) -> str | None:
-    """Refuse to merge partials that did not come from ONE run, and refuse a
-    run that is missing a rank. Returns the run fingerprint to carry onto the
-    merged artifact.
+    """Validate that partials form one complete, non-overlapping run.
 
-    A search's partial directory is addressed by (queries stem, search name, k)
-    alone, so any two runs agreeing on those three write into it. Files are
-    named `rank<NNN>.parquet`, so a re-run overwrites only the ranks it has:
-    32 ranks landing on a 64-rank run's leftovers produce a directory of 64
-    partials, half of them stale. Nothing about the rows says so — the stale
-    slices merge cleanly, double-counting the corpus regions they overlap and
-    missing the ones nobody covered, and the output is a wrong top-K that looks
-    entirely normal.
-
-    Three checks, in the order a failure is most likely:
-
-    1. every partial carries the same `run_fingerprint` (see
-       `results.run_identity`) — this is the mixed-runs case;
-    2. every partial's `config_fingerprint` matches the config THIS merge was
-       handed — the same idea as the existing `tiebreak` check, extended to
-       every other field that changes results (tiebreak keeps its own check,
-       whose message is more specific than this one);
-    3. the ranks present are exactly `0..num_jobs-1` — this is the missing-rank
-       case, which the old "every search has the same partial count" check
-       cannot see, because a rank that dies before writing anything leaves
-       every search short by exactly one.
+    Returns the run fingerprint to carry onto the merged artifact. Missing
+    legacy metadata is warned about where it cannot be verified; known double
+    coverage is always refused.
     """
-    stamps = [(f, r.schema_arrow.metadata or {}) for f, r in zip(partials, readers)]
+    if len(partials) != len(readers):
+        raise RuntimeError(
+            f"search={spec.name!r}: found {len(partials)} partials but opened "
+            f"{len(readers)} readers"
+        )
+    if not partials:
+        raise RuntimeError(f"search={spec.name!r}: no partials to merge")
+
+    stamps = [
+        (f, r.schema_arrow.metadata or {})
+        for f, r in zip(partials, readers)
+    ]
 
     def _get(meta: dict, key: bytes) -> str | None:
         value = meta.get(key)
         return value.decode() if value is not None else None
 
+    # All stamped partials must belong to the same run.
     runs = {f.read_path: _get(meta, RUN_KEY) for f, meta in stamps}
     present = {sha for sha in runs.values() if sha is not None}
+
     if not present:
-        # Older partials may lack fingerprints; warn but continue with the
-        # independent config/rank validation below.
         logger.warning(
-            "search=%r: none of the %d partials carry a run fingerprint (they "
-            "predate it) — cannot verify they came from a single run. Re-run "
-            "`bf compute` if this directory may hold partials from more than one.",
-            spec.name, len(partials),
+            "search=%r: none of the %d partials carry a run fingerprint; "
+            "cannot verify they came from a single run. Re-run `bf compute` "
+            "if this directory may contain partials from multiple runs.",
+            spec.name,
+            len(partials),
         )
         run_sha = None
-    elif (unstamped := sorted(p for p, sha in runs.items() if sha is None)) or len(present) > 1:
+    elif any(sha is None for sha in runs.values()) or len(present) > 1:
         by_run: dict[str, list[str]] = {}
         for path, sha in runs.items():
             by_run.setdefault(sha or "(unstamped)", []).append(path)
+
         summary = "; ".join(
-            f"{sha[:12] if sha != '(unstamped)' else sha}: {len(paths)} partial(s) "
-            f"e.g. {sorted(paths)[0]}"
+            f"{sha[:12] if sha != '(unstamped)' else sha}: "
+            f"{len(paths)} partial(s), e.g. {sorted(paths)[0]}"
             for sha, paths in sorted(by_run.items())
         )
-        raise RuntimeError(
+
+        _refuse(
+            forced,
+            spec.name,
             f"search={spec.name!r}: the partials under "
-            f"{cfg.output.path}/{partial_dir(cfg, spec)}/ come from MORE THAN ONE "
-            f"run — {summary}. Merging them would double-count the corpus where "
-            "their slices overlap and miss it where neither covered, producing a "
-            "wrong top-K that looks normal. Delete the directory and re-run "
-            "`bf compute` for this search."
+            f"{cfg.output.path}/{partial_dir(cfg, spec)}/ come from MORE THAN "
+            f"ONE run — {summary}. Merging them could double-count overlapping "
+            "corpus slices and omit others, producing a wrong top-K that looks "
+            "normal. Delete the directory and re-run `bf compute` for this search.",
         )
+        run_sha = None
     else:
-        run_sha = present.pop()
+        run_sha = next(iter(present))
 
+    # Verify config fingerprints where available. Legacy unstamped partials are
+    # allowed, but explicitly remain unverified.
     want_config = config_identity(cfg, spec)
-    mismatched = [
-        f.read_path for f, meta in stamps
-        if (_get(meta, CONFIG_KEY) or want_config) != want_config
-    ]
-    if mismatched:
-        raise RuntimeError(
-            f"search={spec.name!r}: partial {mismatched[0]} was computed from a "
-            "different config than this merge was given (metric/k/filter/rows, "
-            "the corpus or queries paths and columns, or `allow_tf32` differ). "
-            "Merge with the config that produced these partials, or re-run "
-            "`bf compute`."
+    configs = {
+        f.read_path: _get(meta, CONFIG_KEY)
+        for f, meta in stamps
+    }
+
+    unstamped_configs = sorted(
+        path for path, sha in configs.items() if sha is None
+    )
+    if unstamped_configs:
+        logger.warning(
+            "search=%r: %d of %d partial(s) lack a config fingerprint; their "
+            "config cannot be verified.",
+            spec.name,
+            len(unstamped_configs),
+            len(stamps),
         )
 
-    declared = {_get(meta, NUM_JOBS_KEY) for _, meta in stamps}
-    if declared == {None}:
-        return run_sha  # single-node partials, or pre-stamp: no rank set to check
-    if len(declared) > 1:
-        raise RuntimeError(
-            f"search={spec.name!r}: partials disagree about how many ranks the "
-            f"run had ({sorted(str(d) for d in declared)}) — they cannot be from "
-            "one run. Delete the partial directory and re-run `bf compute`."
+    mismatched = sorted(
+        path
+        for path, sha in configs.items()
+        if sha is not None and sha != want_config
+    )
+    if mismatched:
+        _refuse(
+            forced,
+            spec.name,
+            f"search={spec.name!r}: partial {mismatched[0]} was computed from "
+            "a different config than this merge was given "
+            "(metric/k/filter/rows, corpus or query paths/columns, or "
+            "`allow_tf32` differ). Merge with the config that produced these "
+            "partials, or re-run `bf compute`.",
         )
-    num_jobs = int(declared.pop())
-    ranks = []
+
+    # Rank identity requires job_rank; completeness additionally requires num_jobs.
+    ranks: list[int] = []
     for f, meta in stamps:
         rank = _get(meta, JOB_RANK_KEY)
         if rank is None:
             continue
+
         try:
             r = int(rank)
         except ValueError:
             raise RuntimeError(
-                f"search={spec.name!r}: partial {f.read_path} declares job_rank="
-                f"{rank!r}, which is not an integer. Its metadata is corrupt; "
-                "re-run `bf compute` for that rank."
+                f"search={spec.name!r}: partial {f.read_path} declares "
+                f"job_rank={rank!r}, which is not an integer. Its metadata is "
+                "corrupt; re-run `bf compute` for that rank."
             ) from None
-        # Filename and metadata must identify the same rank.
+
+        if r < 0:
+            raise RuntimeError(
+                f"search={spec.name!r}: partial {f.read_path} declares "
+                f"job_rank={r}; job_rank must be non-negative."
+            )
+
         stem = f.read_path.rsplit("/", 1)[-1]
         if (m := re.fullmatch(r"rank(\d+)\.parquet", stem)) and int(m.group(1)) != r:
             raise RuntimeError(
-                f"search={spec.name!r}: {stem} declares job_rank={r} — the file "
-                "name and its metadata disagree, so one of them was rewritten "
-                "and the rank set cannot be trusted. Delete the directory and "
-                "re-run `bf compute` for this search."
+                f"search={spec.name!r}: {stem} declares job_rank={r} — the "
+                "filename and metadata disagree, so the rank set cannot be "
+                "trusted. Delete the directory and re-run `bf compute`."
             )
-        ranks.append(r)
-    ranks = sorted(ranks)
-    missing = sorted(set(range(num_jobs)) - set(ranks))
 
-    # Require exactly ranks 0..num_jobs-1; reject both missing and extra ranks.
-    extra = sorted(set(ranks) - set(range(num_jobs)))
-    if (missing or extra or len(ranks) != len(stamps)
-            or len(set(ranks)) != len(ranks)):
-        raise RuntimeError(
-            f"search={spec.name!r}: the run declared {num_jobs} ranks but this "
-            f"directory holds {len(stamps)} partial(s) covering ranks {ranks}"
-            + (f", missing {missing}" if missing else "")
-            + (f", and {extra} outside 0..{num_jobs - 1}" if extra else "")
-            + ". Each missing rank's slice of the corpus is simply absent from "
-            "the merged top-K, silently lowering every recall number computed "
-            "against it. Re-run `bf compute --num-jobs "
-            f"{num_jobs} --job-rank R` for the missing rank(s) before merging."
+        ranks.append(r)
+
+    ranks.sort()
+    dupes = sorted({
+        a for a, b in zip(ranks, ranks[1:])
+        if a == b
+    })
+
+    declared = {_get(meta, NUM_JOBS_KEY) for _, meta in stamps}
+    sharded = declared != {None}
+
+    # Mixed stamped/unstamped ranks are ambiguous. Fully legacy, unsharded
+    # directories are allowed with a warning because distinctness is unknowable.
+    unstamped_ranks = len(ranks) != len(stamps) and (bool(ranks) or sharded)
+
+    if not ranks and not sharded and len(stamps) > 1:
+        logger.warning(
+            "search=%r: none of the %d partials carry a job_rank, so distinct "
+            "corpus coverage cannot be verified. These partials predate the "
+            "stamp; re-run `bf compute` if that guarantee is required.",
+            spec.name,
+            len(stamps),
         )
+
+    # Duplicate or ambiguous rank coverage can count corpus slices twice, so it
+    # is never forceable.
+    if dupes or unstamped_ranks:
+        raise RuntimeError(
+            f"search={spec.name!r}: the partial directory covers rank(s) "
+            + (f"{dupes} more than once" if dupes else "")
+            + (" and " if dupes and unstamped_ranks else "")
+            + (
+                f"{len(stamps) - len(ranks)} partial(s) carry no job_rank and "
+                "cannot be shown not to duplicate another rank"
+                if unstamped_ranks else ""
+            )
+            + f" (ranks present: {ranks}). Those corpus slices could be counted "
+            "TWICE, producing duplicate document ids and fewer than k distinct "
+            "results. This is refused even under NOVA_BF_MERGE_FORCE. Delete "
+            "the duplicate/stray partials and re-run the affected rank(s)."
+        )
+
+    if not sharded:
+        return run_sha
+
+    # Different num_jobs values describe different corpus partitions and can
+    # therefore overlap even when their rank numbers differ.
+    if len(declared) > 1:
+        raise RuntimeError(
+            f"search={spec.name!r}: partials disagree about how many ranks the "
+            f"run had ({sorted(str(d) for d in declared)}) — their rank numbers "
+            "refer to DIFFERENT corpus partitions and those partitions can "
+            "overlap. This is refused even under NOVA_BF_MERGE_FORCE. Delete "
+            "the partial directory and re-run `bf compute`."
+        )
+
+    raw_num_jobs = next(iter(declared))
+    try:
+        num_jobs = int(raw_num_jobs)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"search={spec.name!r}: num_jobs={raw_num_jobs!r} is not an integer; "
+            "the partial metadata is corrupt."
+        ) from None
+
+    if num_jobs < 1:
+        raise RuntimeError(
+            f"search={spec.name!r}: num_jobs={num_jobs} must be positive; "
+            "the partial metadata is corrupt."
+        )
+
+    expected = set(range(num_jobs))
+    actual = set(ranks)
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+
+    if extra:
+        raise RuntimeError(
+            f"search={spec.name!r}: rank(s) {extra} are outside "
+            f"0..{num_jobs - 1} (ranks present: {ranks}); their corpus slices "
+            "are not part of this run. Delete the stray partials and re-run "
+            "`bf compute`."
+            + (
+                f" This directory is ALSO missing rank(s) {missing}; fix both "
+                "before merging."
+                if missing else ""
+            )
+        )
+
+    # Missing coverage is incomplete but non-duplicated, so it may be forced.
+    if missing:
+        _refuse(
+            forced,
+            spec.name,
+            f"search={spec.name!r}: the run declared {num_jobs} ranks but this "
+            f"directory holds {len(stamps)} partial(s) covering ranks {ranks}, "
+            f"missing {missing}. Each missing rank's corpus slice is absent "
+            "from the merged top-K, silently lowering recall computed against "
+            "it. Re-run `bf compute --num-jobs "
+            f"{num_jobs} --job-rank R` for the missing rank(s) before merging.",
+        )
+
     return run_sha
 
 
 def _reduce(
     cfg: BruteForceConfig, spec: SearchSpec, out: Store, partials: list[ParquetFile],
-    readers: list[pq.ParquetFile],
+    readers: list[pq.ParquetFile], forced: bool = False,
 ) -> dict:
     """Reduce one search's partials into its final Parquet and manifest entry."""
     k = spec.k
     _reset_fold_used()
-    
     # Validate that all partials belong to the same complete compute run.
-    run_sha = _validate_one_run(cfg, spec, partials, readers)
+    run_sha = _validate_one_run(cfg, spec, partials, readers, forced)
     n_rows = readers[0].metadata.num_rows
     for f, r in zip(partials, readers):
         if r.metadata.num_rows != n_rows:
@@ -798,7 +894,7 @@ def _reduce(
         stamped = (r.schema_arrow.metadata or {}).get(TIEBREAK_KEY)
         stamped = stamped.decode() if stamped is not None else None
         if stamped is not None and stamped != cfg.params.tiebreak:
-            raise RuntimeError(
+            _refuse(forced, spec.name,
                 f"partial {f.read_path} was computed with params.tiebreak="
                 f"{stamped!r}, but this merge was given {cfg.params.tiebreak!r}. "
                 "Ties would be reduced by a rule the partials were not built for. "
@@ -809,7 +905,7 @@ def _reduce(
     has_tie = ["hit_tie" in r.schema_arrow.names for r in readers]
     if any(has_tie) and not all(has_tie):
         missing = [f.read_path for f, h in zip(partials, has_tie) if not h]
-        raise RuntimeError(
+        _refuse(forced, spec.name,
             "some partials carry a hit_tie ordinate and others do not "
             f"(missing from {missing[:3]}); they cannot have come from one run. "
             "Re-run `bf compute` for this search."
@@ -885,13 +981,19 @@ def _reduce(
         )
         state[idx] = (ids2, sc2, ti2)
 
-    # Bound concurrent partial reads by the merge memory budget.
     ranged = bool(cfg.params.merge_ranged_reads)
-    window_n = _merge_window(readers, hit_cols, len(partials), ranged)
+    window_n = _merge_window(cfg, len(partials))
+    inputs_forced = _inputs_forced(readers)
     # Preserve the original URI scheme and divide ranged-read concurrency across 
     # all in-flight partials.
-    src = Store(out.uri, ranged_get=ranged,
-                ranged_get_concurrency=max(1, 24 // max(1, window_n)))
+    # FLOOR-divide and never round up: `_ranged_download` builds this pool PER
+    # FILE, so `window_n * per_file` is what is actually outstanding. `max(1,
+    # ...)` alone breached the pool once the window stopped being capped at 16
+    # -- measured 64 concurrent GETs at merge_window=64, each pinning a whole
+    # raw file. Capping the window restores the invariant; asserting it here
+    # keeps the two from drifting apart again.
+    per_file = max(1, _RANGED_GET_POOL // max(1, window_n))
+    src = Store(out.uri, ranged_get=ranged, ranged_get_concurrency=per_file)
     q: Queue = Queue(maxsize=window_n)
     window = Semaphore(window_n)
 
@@ -931,6 +1033,11 @@ def _reduce(
     started = 0
     drained = 0
     failed = False
+    # PHASE TIMERS.
+    t_io = 0.0          # consumer blocked waiting for a partial to arrive
+    t_fold = 0.0        # folding a partial into the running top-K state
+    t_write = 0.0       # the final parquet write
+    t_reduce0 = time.perf_counter()
     try:
         # Track successful starts so only live readers are drained/joined.
         for t in threads:
@@ -939,7 +1046,9 @@ def _reduce(
         # Drain every started reader even after failure; otherwise readers can 
         # remain blocked on the queue or semaphore while holding partial buffers.
         for _ in range(started):
+            _t = time.perf_counter()
             i, tbl = q.get()
+            t_io += time.perf_counter() - _t
             drained += 1
             if tbl is None:                 # this reader failed or stood down
                 failed = True
@@ -951,10 +1060,12 @@ def _reduce(
                 window.release()
                 continue
             try:
+                _t = time.perf_counter()
                 for bi in range(n_batches):
                     sl = tbl.slice(bi * batch_rows, batch_rows)
                     if sl.num_rows:
                         _fold(bi, sl, keep_head=(i == 0))
+                t_fold += time.perf_counter() - _t
             except BaseException as exc:     # noqa: BLE001 - re-raised below
                 errors.append(exc)
                 fold_errors.append(exc)
@@ -1016,6 +1127,7 @@ def _reduce(
         raise primary
 
     # All partials are folded; write each query batch and release its state
+    t_write0 = time.perf_counter()
     sink = out.fs.open_output_stream(path)
     writer: pq.ParquetWriter | None = None
     body_ok = False
@@ -1034,7 +1146,8 @@ def _reduce(
             # Preserve the provenance carried by the compute partials.
             table = table.replace_schema_metadata(
                 provenance(cfg, spec, carried_dtypes, run_sha=run_sha,
-                           num_jobs=len(partials), reducing=True)
+                           reducing=True, num_jobs=len(partials),
+                           forced=forced, inputs_forced=inputs_forced)
             )
             if writer is None:
                 writer = pq.ParquetWriter(sink, table.schema, compression="snappy")
@@ -1076,6 +1189,40 @@ def _reduce(
             raise close_err
 
     warn_if_short(short_count, n_rows, k, spec.name, logger)
+
+    t_write = time.perf_counter() - t_write0
+    t_reduce = time.perf_counter() - t_reduce0
+    # `other_s` is the RESIDUAL, and it is printed because the three phases do
+    # NOT sum to the reduce.
+    t_other = t_reduce - t_io - t_fold - t_write
+
+    def _read_bytes(i: int, r: pq.ParquetFile) -> int:
+        want = None if ranged else set(
+            hit_cols + ["query_id"] + (payload_cols if i == 0 else []))
+        return sum(
+            col.total_compressed_size
+            for g in range(r.metadata.num_row_groups)
+            for col in (r.metadata.row_group(g).column(c)
+                        for c in range(r.metadata.row_group(g).num_columns))
+            
+            if want is None or col.path_in_schema in want
+            or col.path_in_schema.split(".")[0] in want
+        )
+    _gb = sum(_read_bytes(i, r) for i, r in enumerate(readers)) / 1e9
+    logger.info(
+        "merge-bench search=%r partials=%d queries=%d k=%d gb=%.2f "
+        "reduce_s=%.1f io_wait_s=%.1f fold_s=%.1f write_s=%.1f other_s=%.1f "
+        "fold=%s read_mbps=%.0f",
+        spec.name, len(partials), n_rows, k, _gb,
+        t_reduce, t_io, t_fold, t_write, t_other,
+        # `_FOLD_USED`, not `_fold_device()`. The latter reports the device
+        # that was AVAILABLE; `_topk_merge` then declines it and falls back to
+        # NumPy whenever the ids are not fixed-width lane-rankable, so the
+        # field said `cuda` in precisely the case it exists to detect -- "the
+        # kernel is slow" versus "there was no kernel".
+        ",".join(sorted(_FOLD_USED)) or "none",
+        (_gb * 1000 / t_reduce) if t_reduce else 0.0,
+    )
     logger.info("search=%r wrote %s (%d queries)", spec.name, path, n_rows)
     entry = run_manifest.search_entry(spec)
     entry.update({
@@ -1091,5 +1238,7 @@ def _reduce(
         "queries_short_of_k": short_count,
         "corpus_dtype": carried_dtypes.get("corpus_dtype"),
         "queries_dtype": carried_dtypes.get("queries_dtype"),
+        # Only when true, so a clean merge's manifest says nothing about it.
+        **({"merge_forced": True} if forced or inputs_forced else {}),
     })
     return entry

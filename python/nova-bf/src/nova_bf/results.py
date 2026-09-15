@@ -25,9 +25,40 @@ TIEBREAK_KEY = b"nova_bf_tiebreak"
 # Schema-metadata keys identifying WHICH RUN produced a partial.
 RUN_KEY = b"nova_bf.run_fingerprint"
 CONFIG_KEY = b"nova_bf.config_fingerprint"
+# Present (and "true") when the merge that wrote this artifact ran with its
+# provenance checks FORCED OFF. See `merge_forced`.
+FORCED_KEY = b"nova_bf.merge_forced"
 NUM_JOBS_KEY = b"nova_bf.num_jobs"
 JOB_RANK_KEY = b"nova_bf.job_rank"
 
+
+_FORCE_ENV = "NOVA_BF_MERGE_FORCE"
+_TRUTHY = ("1", "true", "yes", "on")
+_FALSEY = ("", "0", "false", "no", "off")
+
+
+def merge_forced(cfg: BruteForceConfig) -> bool:
+    """Return whether provenance checks are explicitly forced.
+
+    NOVA_BF_MERGE_FORCE overrides params.merge_force. Invalid environment
+    values are refused rather than guessed.
+    """
+    raw = os.environ.get(_FORCE_ENV)
+    if raw is not None:
+        value = raw.strip().lower()
+
+        if value in _TRUTHY:
+            return True
+        if value in _FALSEY:
+            return False
+
+        raise RuntimeError(
+            f"{_FORCE_ENV}={raw!r} is not a boolean; use one of "
+            f"{'/'.join(_TRUTHY)} or "
+            f"{'/'.join(x for x in _FALSEY if x)}"
+        )
+
+    return bool(getattr(cfg.params, "merge_force", False))
 
 def queries_stem(queries_path: str) -> str:
     base = queries_path.rstrip("/").split("/")[-1]
@@ -158,6 +189,8 @@ def provenance(
     max_files: int | None = None,
     run_sha: str | None = None,
     reducing: bool = False,
+    forced: bool = False,
+    inputs_forced: bool = False,
 ) -> dict[bytes, bytes]:
     """How this ground truth was computed, for the parquet schema metadata.
 
@@ -222,6 +255,9 @@ def provenance(
     # Which run this came from
     config_sha = config_identity(cfg, spec)
     out[CONFIG_KEY] = config_sha.encode()
+    # A FORCED merge cannot vouch for anything above.
+    if reducing and (forced or inputs_forced):
+        out[FORCED_KEY] = b"true"
     # `merge` gets run identity only from its partials. If old partials have no
     # fingerprint, leave it unknown rather than inventing one from missing inputs.
     # `compute` has the real inputs and is the only place that creates a fallback.

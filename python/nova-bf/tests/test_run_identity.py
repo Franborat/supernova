@@ -10,6 +10,8 @@ such mixture on purpose and assert the merge refuses it.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -26,9 +28,11 @@ from nova_bf.config import (
     QueriesConfig,
     SearchSpec,
 )
-from nova_bf.merge import run_merge
+from nova_bf.manifest import manifest_name
+from nova_bf.merge import _inputs_forced, run_merge
 from nova_bf.results import (
-    RUN_KEY, config_identity, partial_dir, provenance, run_identity,
+    CONFIG_KEY, FORCED_KEY, RUN_KEY, config_identity, merge_forced, partial_dir,
+    provenance, result_name, run_identity,
 )
 
 DIM, K = 8, 3
@@ -327,3 +331,429 @@ def test_disabling_the_twopass_verification_changes_the_run_identity(ds, tmp_pat
     assert clean != unverified, (
         "a run with the exactness proof disabled has the same identity as one "
         "without it, so their partials would merge silently")
+
+
+# --------------------------------------------------------------------------
+# NOVA_BF_MERGE_FORCE: one blunt, recorded escape hatch.
+#
+# Every test below drives `run_merge` (or, where the property is about what a
+# LATER merge sees, a real artifact `run_merge` wrote). The mechanism these
+# replaced was tested by poking module globals, and a reviewer showed four
+# mutations -- including deleting the mechanism outright -- passing the whole
+# suite. There is no module state left to poke.
+# --------------------------------------------------------------------------
+
+def _config_drift(ds, tmp_path, **params):
+    """One complete run, merged under a DIFFERENT config. Returns (cfg, out).
+
+    This is the motivating case for the flag, and the shape it is safe on: all
+    partials come from one run, cover distinct slices, and are complete -- only
+    the fingerprint the merge recomputes disagrees, which is exactly what a
+    field added to `config_identity` does to perfectly good partials.
+
+    NOT the mixed-leftovers shape (`_run(cfg, 4)` then `_run(cfg, 2)`), which
+    these tests used to use. That one is DOUBLE COVERAGE, not unverified
+    provenance: sharding is `i % num_jobs == job_rank`, so rank numbers from
+    two different `num_jobs` name slices of different PARTITIONS and the
+    overlap is folded twice. It is refused whatever the flag says -- see
+    `test_disagreeing_num_jobs_is_refused_even_when_forced`.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    _run(_cfg(ds, out), 2)
+    return _cfg(ds, out, allow_tf32=True, **params), out
+
+
+def _artifact_meta(path):
+    return pq.ParquetFile(str(path)).schema_arrow.metadata or {}
+
+
+def test_merge_is_not_forced_by_default(ds, tmp_path, monkeypatch):
+    """Off unless asked, from either source."""
+    monkeypatch.delenv("NOVA_BF_MERGE_FORCE", raising=False)
+    cfg, _ = _config_drift(ds, tmp_path)
+    assert merge_forced(cfg) is False
+    with pytest.raises(RuntimeError, match="different config"):
+        run_merge(cfg)
+
+
+def test_forcing_merges_a_drifted_config_and_says_so_everywhere(
+    ds, tmp_path, monkeypatch
+):
+    """The motivating case, end to end: a merge that would refuse is forced
+    through, and BOTH the artifact and the manifest record that it was."""
+    cfg, out = _config_drift(ds, tmp_path)
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "1")
+
+    paths = run_merge(cfg)
+    meta = _artifact_meta(out / result_name(cfg, cfg.searches[0]))
+    assert meta.get(FORCED_KEY) == b"true", (
+        "a forced artifact must carry the marker; without it the file is "
+        "indistinguishable from verified ground truth")
+
+    doc = json.loads((out / manifest_name(cfg, "merge")).read_text())
+    assert doc.get("merge_forced") is True, "the manifest is what a human reads first"
+    assert paths, "the merge still produced its output"
+
+
+def test_a_clean_merge_carries_no_forced_marker(ds, tmp_path, monkeypatch):
+    """The control. A marker that is always present says nothing."""
+    monkeypatch.delenv("NOVA_BF_MERGE_FORCE", raising=False)
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _cfg(ds, out)
+    _run(cfg, 2)
+    run_merge(cfg)
+
+    assert FORCED_KEY not in _artifact_meta(out / result_name(cfg, cfg.searches[0]))
+    doc = json.loads((out / manifest_name(cfg, "merge")).read_text())
+    assert "merge_forced" not in doc
+
+
+def test_forcing_still_stamps_the_config_fingerprint(ds, tmp_path, monkeypatch):
+    """The marker INVALIDATES the provenance block; it does not edit it.
+
+    The previous mechanism omitted `config_fingerprint` and went on stamping
+    `metric`, `k`, the paths and `allow_tf32` from the same config it had just
+    admitted might not describe these rows — so the hash a consumer cannot
+    read was withheld while the human-readable claims it summarised were still
+    asserted. One marker covers all of it, and, unlike an absent key, cannot
+    be confused with a partial that predates the key.
+    """
+    cfg, out = _config_drift(ds, tmp_path)
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "true")
+    run_merge(cfg)
+
+    meta = _artifact_meta(out / result_name(cfg, cfg.searches[0]))
+    assert meta.get(FORCED_KEY) == b"true"
+    assert CONFIG_KEY in meta, "the block is marked untrusted, not partly deleted"
+    assert meta[b"nova_bf.allow_tf32"] == b"true", (
+        "still copied from this merge's config — which is exactly what the "
+        "marker warns the reader about")
+
+
+def test_forcing_does_not_launder_through_a_re_merge(ds, tmp_path, monkeypatch):
+    """A forced artifact re-merged by a CLEAN merge stays marked.
+
+    Without propagation the second merge would stamp a fresh fingerprint for
+    whatever config it was handed and drop the marker, so the taint would be
+    washed out by one extra hop.
+    """
+    from nova_bf.results import JOB_RANK_KEY, NUM_JOBS_KEY
+
+    cfg, out = _config_drift(ds, tmp_path)
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "1")
+    run_merge(cfg)
+    forced = out / result_name(cfg, cfg.searches[0])
+    assert _artifact_meta(forced).get(FORCED_KEY) == b"true"
+    assert _inputs_forced([pq.ParquetFile(str(forced))]) is True
+
+    # Re-stage the forced artifact as a clean single-rank partial directory.
+    out2 = tmp_path / "out2"
+    pdir = out2 / partial_dir(cfg, cfg.searches[0])
+    pdir.mkdir(parents=True)
+    t = pq.read_table(str(forced))
+    md = dict(t.schema.metadata or {})
+    md[NUM_JOBS_KEY], md[JOB_RANK_KEY] = b"1", b"0"
+    pq.write_table(t.replace_schema_metadata(md), str(pdir / "rank000.parquet"))
+
+    monkeypatch.delenv("NOVA_BF_MERGE_FORCE", raising=False)
+    # Matching config, so the second merge trips NOTHING: the marker it ends up
+    # with can only have come from its input.
+    cfg2 = _cfg(ds, out2, allow_tf32=True)
+    assert merge_forced(cfg2) is False, "the second merge is clean"
+    run_merge(cfg2)
+
+    # Through run_merge, not by calling `provenance` by hand: dropping
+    # `inputs_forced=` from `_reduce`'s call site -- the only place it is ever
+    # wired -- passed the whole suite while the propagation was unreachable.
+    assert _artifact_meta(
+        out2 / result_name(cfg2, cfg2.searches[0])).get(FORCED_KEY) == b"true", (
+        "a clean re-merge laundered the forced marker off its input")
+    doc2 = json.loads((out2 / manifest_name(cfg2, "merge")).read_text())
+    assert doc2.get("merge_forced") is True, (
+        "the parquet kept the marker but the manifest -- what a human reads "
+        "first -- came out clean")
+
+
+def test_the_force_flag_reads_from_the_config_too(ds, tmp_path, monkeypatch):
+    """A rescue that outlives one shell needs to be committable."""
+    monkeypatch.delenv("NOVA_BF_MERGE_FORCE", raising=False)
+    cfg, out = _config_drift(ds, tmp_path)
+    forced_cfg = _cfg(ds, out, allow_tf32=True, merge_force=True)
+    assert merge_forced(forced_cfg) is True
+    run_merge(forced_cfg)
+    assert _artifact_meta(out / result_name(cfg, cfg.searches[0])).get(FORCED_KEY) == b"true"
+
+
+@pytest.mark.parametrize("val", ["0", "false", "no", "off"])
+def test_an_explicit_false_env_beats_a_forced_config(ds, tmp_path, monkeypatch, val):
+    """`NOVA_BF_MERGE_FORCE=0` must be able to turn OFF a committed
+    `merge_force: true`, not merely fail to turn it on. An operator disarming
+    a config they inherited has no other lever."""
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", val)
+    cfg, out = _config_drift(ds, tmp_path)
+    forced_cfg = _cfg(ds, out, allow_tf32=True, merge_force=True)
+    assert merge_forced(forced_cfg) is False
+    with pytest.raises(RuntimeError, match="different config"):
+        run_merge(forced_cfg)
+
+
+@pytest.mark.parametrize("val", ["maybe", "yes please", "2", "all", "config"])
+def test_an_unparseable_force_value_is_refused_not_guessed(
+    ds, tmp_path, monkeypatch, val
+):
+    """Both defaults are wrong: treating it as false refuses a merge the
+    operator meant to force, treating it as true forces one they did not.
+    `config`/`all` are included because they were valid under the per-check
+    variable this replaced, so a stale invocation must fail loudly rather than
+    read as either answer.
+    """
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", val)
+    cfg, _ = _config_drift(ds, tmp_path)
+    with pytest.raises(RuntimeError, match="NOVA_BF_MERGE_FORCE"):
+        run_merge(cfg)
+
+
+def test_the_force_value_is_validated_before_any_reduce(ds, tmp_path, monkeypatch):
+    """A typo must surface before the merge spends its I/O, not after.
+
+    Asserted on the READS. `raises` plus "no output file" does not show this:
+    `merge_forced` was also reachable from `provenance`, and `_reduce`'s
+    `finally` deletes the incomplete output on any failure -- so both held with
+    the preamble check removed entirely.
+    """
+    import nova_bf.merge as m
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _cfg(ds, out)
+    _run(cfg, 2)                               # a merge that would SUCCEED
+
+    reads: list[str] = []
+    real = m.Store.read_columns
+
+    def spy(self, read_path, columns):
+        reads.append(read_path)
+        return real(self, read_path, columns)
+
+    monkeypatch.setattr(m.Store, "read_columns", spy)
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "yepp")
+    with pytest.raises(RuntimeError, match="NOVA_BF_MERGE_FORCE"):
+        run_merge(cfg)
+    assert reads == [], (
+        f"the merge read {len(reads)} partial(s) before noticing the typo; the "
+        "flag must be resolved in run_merge's preamble")
+    assert not list(out.glob("bf_*.parquet")), "nothing was written"
+
+
+def test_merge_force_is_a_config_field(ds, tmp_path):
+    """It must survive a YAML round trip, or it cannot be committed."""
+    import yaml
+
+    cfg = _cfg(ds, tmp_path / "out")
+    assert cfg.params.merge_force is False, "off by default"
+    raw = yaml.safe_load(yaml.safe_dump(cfg.model_dump(mode="json")))
+    raw["params"]["merge_force"] = True
+    assert BruteForceConfig(**raw).params.merge_force is True
+
+
+def _stamped(job_rank, num_jobs=2, run=b"R", tie=b"id"):
+    """A minimal partial/reader pair carrying just the metadata the rank
+    checks read — enough to drive `_validate_one_run` without a compute run."""
+    import types
+    from nova_bf.results import RUN_KEY, NUM_JOBS_KEY, JOB_RANK_KEY, TIEBREAK_KEY
+
+    meta = {RUN_KEY: run, TIEBREAK_KEY: tie, NUM_JOBS_KEY: str(num_jobs).encode()}
+    if job_rank is not None:
+        meta[JOB_RANK_KEY] = str(job_rank).encode()
+    schema = types.SimpleNamespace(
+        metadata=meta, names=["query_id", "hit_ids", "hit_scores"])
+    reader = types.SimpleNamespace(schema_arrow=schema)
+    r = job_rank if job_rank is not None else 9
+    parquet = types.SimpleNamespace(read_path=f"dir/rank{r:03d}.parquet")
+    return parquet, reader
+
+
+@pytest.mark.parametrize("ranks,why", [
+    ([0, 0, 1], "a duplicated rank double-counts its corpus slice"),
+    ([0, 1, 5], "a rank outside 0..num_jobs-1 is not part of this run"),
+    ([0, 1, None], "a partial with no job_rank cannot be shown not to duplicate"),
+])
+def test_double_coverage_is_refused_even_when_forced(
+    ds, tmp_path, monkeypatch, ranks, why
+):
+    """The one carve-out. Every other check says "I cannot VERIFY this is
+    right"; this one says "I can prove it is wrong" — the merged top-K would
+    hold the same document id in several slots and fewer than k distinct
+    documents per query. Forcing buys unverified output, never corrupt output.
+
+    Driven through `_validate_one_run`, not by grepping the source. An earlier
+    version of this test asserted only that the string `"if dupes or extra:"`
+    appeared in merge.py — it passed while a reviewer demonstrated a live
+    counterexample.
+    """
+    from nova_bf import merge as m
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "1")
+    cfg = _cfg(ds, tmp_path / "out")
+    spec = cfg.searches[0]
+    assert merge_forced(cfg) is True, "the carve-out is what refuses, not the flag"
+    # Every partial carries the config fingerprint this merge computes, so the
+    # config check passes and the rank checks are what the test reaches.
+    sha = config_identity(cfg, spec).encode()
+    pairs = [_stamped(r, num_jobs=2) for r in ranks]
+    for _, rd in pairs:
+        rd.schema_arrow.metadata[CONFIG_KEY] = sha
+    # Each of the three has its own message: duplicates and unstamped partials
+    # say "counted TWICE", an out-of-range rank says it is not part of this
+    # run. All three refuse, which is what the test is about.
+    with pytest.raises(RuntimeError,
+                       match="counted TWICE|refused even under|not part of this run"):
+        m._validate_one_run(cfg, spec, [f for f, _ in pairs], [r for _, r in pairs])
+
+
+def test_disagreeing_num_jobs_is_refused_even_when_forced(ds, tmp_path, monkeypatch):
+    """Two runs' leftovers are DOUBLE COVERAGE, not unverified provenance.
+
+    Sharding is `i % num_jobs == job_rank`, so a rank NUMBER only names a
+    corpus slice relative to its own `num_jobs`. A 4-way run overwritten by a
+    2-way one leaves ranks {0,1,2,3} all distinct AS NUMBERS while the 4-way
+    rank2/rank3 slices ({2,6,...}/{3,7,...}) sit inside the 2-way rank0/rank1
+    slices ({0,2,4,...}/{1,3,5,...}) -- files 2 and 3 folded twice.
+
+    An earlier version routed this through the flag on the argument that
+    distinct rank numbers meant distinct slices. Forced, it returned normally
+    and produced a k=3 top-K holding the same document id in two of three
+    slots for 4 of 4 queries.
+    """
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _cfg(ds, out)
+    _run(cfg, 4)
+    _run(cfg, 2)      # overwrites rank000/rank001, leaves rank002/rank003 stale
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "1")
+    with pytest.raises(RuntimeError, match="folded twice|counted TWICE|DIFFERENT"):
+        run_merge(cfg)
+    assert not list(out.glob("bf_*.parquet")), "nothing was written"
+
+
+def test_a_duplicate_is_caught_with_no_num_jobs_stamp(ds, tmp_path):
+    """Rank IDENTITY must not sit behind the `num_jobs` early return.
+
+    The pre-f050cf5 ground-truth directories carry `job_rank` but predate the
+    `num_jobs` stamp. While the two checks shared `if declared == {None}:
+    return`, such a directory plus one copied partial merged CLEANLY and
+    double-counted that rank's slice -- 4 of 4 queries came back with a
+    repeated document id, nothing forced, nothing logged. Every other rank
+    test in this file stamps `num_jobs`, so this shape was never constructed
+    and reverting the restructure passed the whole suite.
+
+    The copy is named `dup.parquet`, not `rank002.parquet`, so it is the
+    duplicate-rank check that refuses and not the filename-vs-metadata one.
+    """
+    from nova_bf.results import NUM_JOBS_KEY
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _cfg(ds, out)
+    _run(cfg, 2)
+    pdir = out / partial_dir(cfg, cfg.searches[0])
+
+    for f in sorted(pdir.glob("rank*.parquet")):       # strip num_jobs ONLY
+        t = pq.read_table(str(f))
+        md = {k: v for k, v in (t.schema.metadata or {}).items()
+              if k != NUM_JOBS_KEY}
+        pq.write_table(t.replace_schema_metadata(md), str(f))
+    (pdir / "dup.parquet").write_bytes((pdir / "rank000.parquet").read_bytes())
+
+    with pytest.raises(RuntimeError, match="counted TWICE"):
+        run_merge(cfg)
+
+
+def test_a_missing_rank_by_contrast_is_forceable(ds, tmp_path, monkeypatch):
+    """The other side of the carve-out: omission is merely pessimistic, so it
+    is exactly what the flag is for. If this refused too, the flag would be
+    unusable for the case that motivated it."""
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _cfg(ds, out)
+    _run(cfg, 4)
+    sorted((out / partial_dir(cfg, cfg.searches[0])).glob("*.parquet"))[2].unlink()
+
+    monkeypatch.setenv("NOVA_BF_MERGE_FORCE", "1")
+    run_merge(cfg)
+    assert _artifact_meta(out / result_name(cfg, cfg.searches[0])).get(FORCED_KEY) == b"true"
+
+
+# --------------------------------------------------------------------------
+# `params.merge_window` / `NOVA_BF_MERGE_WINDOW`: the operator names the
+# in-flight count. There is no estimate to fall back to -- see
+# `test_merge_window_is_exactly_what_the_operator_set` in test_merge.py for
+# why the metadata-derived one was deleted.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("window,want", [(1, 1), (3, 3), (9, 4)])
+def test_the_merge_window_reaches_run_merge_from_the_config(
+    ds, tmp_path, monkeypatch, window, want
+):
+    """The number in the YAML is the number of readers -- BOTH directions.
+
+    Counted through concurrent `read_columns` calls, not by inspecting what
+    `_merge_window` returned: the pin has to survive the clamp, the Semaphore
+    and the Queue to mean anything. Parametrized because only trying
+    `merge_window=1` pins a ceiling and not a floor -- hard-coding
+    `window_n = 1` at the call site passed that version.
+    """
+    import threading
+    import time
+    import nova_bf.merge as m
+
+    out = tmp_path / "out"
+    out.mkdir()
+    cfg = _cfg(ds, out, merge_window=window)
+    _run(cfg, 4)
+
+    live = peak = 0
+    lock = threading.Lock()
+    real = m.Store.read_columns
+
+    def counting(self, read_path, columns):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        try:
+            time.sleep(0.4)          # hold the permit so readers overlap
+            return real(self, read_path, columns)
+        finally:
+            with lock:
+                live -= 1
+
+    monkeypatch.setattr(m.Store, "read_columns", counting)
+    run_merge(cfg)
+    assert peak == want, (
+        f"merge_window={window} over 4 partials admitted {peak} concurrent "
+        f"readers, expected {want}")
+
+
+def test_the_merge_window_is_a_config_field(ds, tmp_path):
+    """It has to be settable from the YAML the run is launched with, not only
+    from an env var that lives in someone's shell history."""
+    import yaml
+    import pydantic
+
+    cfg = _cfg(ds, tmp_path / "out")
+    assert cfg.params.merge_window == 2, "read/fold overlap by default"
+
+    raw = yaml.safe_load(yaml.safe_dump(cfg.model_dump(mode="json")))
+    raw["params"]["merge_window"] = 3
+    assert BruteForceConfig(**raw).params.merge_window == 3
+
+    # Non-positive values are refused at parse time rather than deadlocking on
+    # `Semaphore(0)` or silently unbounding `Queue(maxsize=0)` at merge time.
+    for bad in (0, -1):
+        raw["params"]["merge_window"] = bad
+        with pytest.raises(pydantic.ValidationError):
+            BruteForceConfig(**raw)

@@ -274,6 +274,16 @@ class ParamsConfig(BaseModel):
     # Helps remote single-row-group partials, but adds one raw file's bytes per
     # in-flight partial and is usually slower for local storage.
     merge_ranged_reads: bool = False
+    # How many partials the merge may hold IN FLIGHT at once. 2 gives
+    # read/fold overlap -- one partial folding while the next arrives; 1 makes
+    # the merge strictly sequential.
+    merge_window: int = Field(default=2, ge=1, strict=True)
+    # Force the merge past its provenance checks (mixed runs, config
+    # mismatch, tie-break mismatch, missing ranks). The output is stamped
+    # `nova_bf.merge_forced=true` and is NOT verified ground truth. Duplicate
+    # rank coverage is refused regardless -- see `merge._refuse`. Overridable
+    # per-invocation with NOVA_BF_MERGE_FORCE.
+    merge_force: bool = False
 
     # Which of two EXACTLY-tied candidates wins.
     # Neither makes SCORES reproducible across batch sizes — re-tiling a matmul

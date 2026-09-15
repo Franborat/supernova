@@ -154,7 +154,7 @@ def _leaky_scenario(tmp_path, monkeypatch, n_partials=8, window=2, slow=1.0,
     _write_partials(cfg, pdir, n_partials=n_partials)
 
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: window)
+                        lambda *a, **k: window)
 
     real_read = Store.read_columns
 
@@ -226,7 +226,7 @@ def test_failed_reduce_pins_no_partial_table_in_memory(tmp_path, monkeypatch):
     _write_partials(cfg, pdir, n_partials=6, n_queries=200)
 
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 3)
+                        lambda *a, **k: 3)
 
     refs: list[weakref.ref] = []
     real_read = Store.read_columns
@@ -290,7 +290,7 @@ def test_consumer_side_failure_also_drains_and_joins_promptly(tmp_path, monkeypa
             str(pdir / f"rank{p:03d}.parquet"))
 
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 1)
+                        lambda *a, **k: 1)
     real_read = Store.read_columns
 
     def slow(self, read_path, columns):
@@ -321,14 +321,14 @@ def test_head_copies_query_id_and_payload_instead_of_slicing_the_partial(
     It used to hold `tbl.slice(...)`. An Arrow slice is a view, so that pinned
     partial 0's whole table -- hit columns included -- for the entire reduce,
     long past the point its window permit was handed back at merge.py's
-    `window.release()`. `_merge_window` budgets `window x partial` and never
+    `window.release()`. The window bounds `window x partial` and never
     accounted for the extra one.
     """
     cfg = _cfg(str(tmp_path / "out"))
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     _write_partials(cfg, pdir, n_partials=3, n_queries=200)
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 1)
+                        lambda *a, **k: 1)
 
     built: list[tuple[str, ...]] = []
     real_table = merge_mod.pa.table
@@ -359,112 +359,6 @@ def test_head_copies_query_id_and_payload_instead_of_slicing_the_partial(
 
 
 # ---------------------------------------------------------------------------
-# `_merge_window` must honour its own byte budget.
-# ---------------------------------------------------------------------------
-
-def test_merge_window_honours_the_byte_budget_below_the_floor(monkeypatch):
-    """The overlap floor must be applied BEFORE the caps, not after.
-
-    `max(MIN, min(fits, MAX, n_partials))` let the floor override everything: a
-    partial larger than the entire budget still returned 2, so the sizing meant
-    to prevent an OOM guaranteed one. One oversized partial must now yield a
-    single reader -- no read/fold overlap, but no multiplied overshoot either.
-    """
-    monkeypatch.setattr(merge_mod, "_hit_bytes_per_partial",
-                        lambda readers, cols, ranged=False: 1 << 50)   # 1 PiB
-    assert merge_mod._merge_window([], ["hit_ids"], n_partials=32) == 1
-
-
-def test_merge_window_never_exceeds_the_partial_count(monkeypatch):
-    """A one-partial merge must not ask for two readers."""
-    monkeypatch.setattr(merge_mod, "_hit_bytes_per_partial",
-                        lambda r, c, ranged=False: 1 << 50)
-    assert merge_mod._merge_window([], ["hit_ids"], n_partials=1) == 1
-    monkeypatch.setattr(merge_mod, "_hit_bytes_per_partial",
-                        lambda r, c, ranged=False: 1)
-    assert merge_mod._merge_window([], ["hit_ids"], n_partials=1) == 1
-
-
-def test_merge_window_with_no_metadata_is_capped_by_the_partial_count(caplog):
-    """`per <= 0` (hit_cols matched no column path) used to return the floor
-    silently and unclamped. It must warn and stay within `n_partials`."""
-    import logging
-    with caplog.at_level(logging.WARNING, logger="nova_bf.merge"):
-        assert merge_mod._merge_window([], ["nonexistent"], n_partials=64) == \
-            merge_mod._MERGE_WINDOW_MIN
-        assert merge_mod._merge_window([], ["nonexistent"], n_partials=1) == 1
-    assert any("no bytes" in r.message or "cannot" in r.message
-               for r in caplog.records), "a blind window must be logged"
-
-
-# ---------------------------------------------------------------------------
-# The window estimate must cover what is actually resident.
-# ---------------------------------------------------------------------------
-
-def _fixture_partial(tmp_path, n_q, k, universe, payload_len, name="p.parquet"):
-    rng = np.random.default_rng(0)
-    uni = [f"doc-{i:09d}" for i in range(universe)]
-    ids = [[uni[j] for j in rng.integers(0, universe, k)] for _ in range(n_q)]
-    scores = [list(rng.random(k)) for _ in range(n_q)]
-    alphabet = np.array(list("abcdefghij0123456789"))
-    payload = {"src": ["".join(rng.choice(alphabet, payload_len)) for _ in range(n_q)]}
-    path = str(tmp_path / name)
-    pq.write_table(build_result_table([f"q{i}" for i in range(n_q)], payload, ids, scores),
-                   path, compression="snappy", row_group_size=4096)
-    return path
-
-
-@pytest.mark.parametrize("universe,label", [(5_000, "dictionary-friendly ids"),
-                                            (200_000, "high-cardinality ids")])
-def test_hit_bytes_per_partial_covers_the_parsed_table(tmp_path, universe, label):
-    """`total_uncompressed_size` is the ENCODED size (dictionary + RLE), not what
-    pyarrow allocates once parsed -- observed well under on a small id universe.
-    `_PARSE_EXPANSION` must close that, whichever way the ids compress."""
-    path = _fixture_partial(tmp_path, 4000, 100, universe, 1)
-    reader = pq.ParquetFile(path)
-    hit_cols = ["hit_ids", "hit_scores"]
-    est = merge_mod._hit_bytes_per_partial([reader], hit_cols)
-    actual = pq.read_table(path, columns=hit_cols).nbytes
-    assert est >= actual, (
-        f"{label}: estimate {est} understates real residency {actual} by "
-        f"{actual/est:.2f}x — the window would be that many times too wide")
-
-
-def test_ranged_get_estimate_includes_the_raw_whole_file_buffer(tmp_path):
-    """With `merge_ranged_reads`, `Store._ranged_download` allocates
-    np.empty(file_size) for the ENTIRE partial -- payload columns included --
-    and holds it while parsing. That sits on top of the parsed table and used to
-    be invisible to the window (many times the budgeted hit bytes), so the
-    `ranged=True` estimate must add it."""
-    import os
-    path = _fixture_partial(tmp_path, 3000, 4, 5000, 600)
-    reader = pq.ParquetFile(path)
-    plain = merge_mod._hit_bytes_per_partial([reader], ["hit_ids", "hit_scores"])
-    ranged = merge_mod._hit_bytes_per_partial([reader], ["hit_ids", "hit_scores"],
-                                              ranged=True)
-    raw = os.path.getsize(path)
-    assert ranged > plain
-    # the added term is the file itself, to within parquet's footer overhead
-    assert 0.9 * raw <= (ranged - plain) <= 1.1 * raw, (ranged, plain, raw)
-
-
-def test_partial_zero_payload_is_a_known_residual_of_the_window_estimate(tmp_path):
-    """Documented limit, not a regression: the window is sized from `hit_cols`,
-    but partial 0 is additionally read with `query_id` + every payload column.
-    The invariant that must hold is coverage of the hit columns; the payload
-    overshoot is bounded by ONE partial, so it cannot scale with the window."""
-    path = _fixture_partial(tmp_path, 2000, 1, 5000, 600)
-    reader = pq.ParquetFile(path)
-    est = merge_mod._hit_bytes_per_partial([reader], ["hit_ids", "hit_scores"])
-    hits = pq.read_table(path, columns=["hit_ids", "hit_scores"]).nbytes
-    full = pq.read_table(path,
-                         columns=["hit_ids", "hit_scores", "query_id", "src"]).nbytes
-    assert est >= hits, "the invariant that must hold: hit columns are covered"
-    print(f"\nresidual: partial 0 parses {full} B but is budgeted {est} B "
-          f"({full/est:.1f}x) — bounded by one partial")
-
-
-# ---------------------------------------------------------------------------
 # `ranged_get` concurrency must be divided by the window.
 # ---------------------------------------------------------------------------
 
@@ -483,7 +377,7 @@ def test_ranged_get_pool_is_divided_by_the_window(tmp_path, monkeypatch):
     monkeypatch.setattr(io_mod, "_RANGED_GET_BYTES", 4096)
     window_n = 4
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: window_n)
+                        lambda *a, **k: window_n)
 
     concurrencies: list[int] = []
     real_dl = Store._ranged_download
@@ -496,10 +390,12 @@ def test_ranged_get_pool_is_divided_by_the_window(tmp_path, monkeypatch):
     merge_mod.run_merge(cfg)
 
     assert concurrencies, "ranged_get path never ran"
-    expected = max(2, io_mod._RANGED_GET_CONCURRENCY // window_n)
+    # `max(1, ...)`, not `max(2, ...)`: a floor of 2 breached the pool above
+    # window_n=12. This agreed with the code only because window_n is 4 here.
+    expected = max(1, merge_mod._RANGED_GET_POOL // window_n)
     assert set(concurrencies) == {expected}, concurrencies
-    # the product is what matters: it must stay at or under the per-file default
-    assert window_n * expected <= io_mod._RANGED_GET_CONCURRENCY
+    # the product is what matters: it must stay at or under the pool
+    assert window_n * expected <= merge_mod._RANGED_GET_POOL
 
 
 # ---------------------------------------------------------------------------
@@ -581,44 +477,27 @@ def test_row_misaligned_partials_are_rejected(tmp_path):
 # Review, 2026-09-05: resource / lifetime / shutdown.
 # ---------------------------------------------------------------------------
 
-def test_window_budget_is_not_fooled_by_dictionary_encoded_ids(tmp_path):
-    """`total_uncompressed_size` is the ENCODED size. With dictionary encoding
-    on -- pyarrow's default, and it reports RLE_DICTIONARY even when the
-    dictionary overflowed -- it tracks the dictionary, not the parsed strings.
-    On `<urn:uuid:...>` ids, the production id shape, the old estimate came to
-    well under the real parsed bytes, so the window ran far wider than
-    it had budgeted for. Under-budgeting costs the run; over-budgeting only
-    costs parallelism."""
-    import uuid
+@pytest.mark.parametrize("window_n", [1, 2, 3, 4, 8, 12, 13, 16, 24, 25, 64])
+def test_range_gets_per_file_shrink_as_the_window_grows(window_n):
+    """The per-file pool is DIVIDED by the window, because `_ranged_download`
+    builds one PER FILE -- so the two cannot both be large.
 
-    q, k = 400, 100
-    pool = [f"<urn:uuid:{uuid.UUID(int=i * 2654435761 % 2**128)}>" for i in range(2000)]
-    rng = np.random.default_rng(0)
-    off = pa.array(np.arange(q + 1, dtype=np.int32) * k)
-    tbl = pa.table({
-        "query_id": pa.array([f"q{i}" for i in range(q)]),
-        "hit_ids": pa.ListArray.from_arrays(
-            off, pa.array([pool[i] for i in rng.integers(0, len(pool), q * k)],
-                          pa.large_string())),
-        "hit_scores": pa.ListArray.from_arrays(
-            off, pa.array(rng.random(q * k).astype(np.float32), pa.float32())),
-    })
-    path = str(tmp_path / "p.parquet")
-    pq.write_table(tbl, path, compression="snappy")     # use_dictionary defaults True
+    The old list ([1, 4, 12, 13, 16]) was exhaustive of the domain when the
+    window came from a byte budget clamped to 16. The window is an operator
+    knob with no ceiling now, so this covers past the pool size too.
 
-    cols = ["hit_ids", "hit_scores"]
-    est = merge_mod._hit_bytes_per_partial([pq.ParquetFile(path)], cols)
-    actual = pq.read_table(path, columns=cols).nbytes
-    assert est >= actual, f"budget {est:,} under-estimates parsed {actual:,}"
-
-
-@pytest.mark.parametrize("window_n", [1, 4, 12, 13, 16])
-def test_total_range_gets_stay_within_the_pool_being_divided(window_n):
-    """The per-file pool is divided by the window because `_ranged_download`
-    builds one PER FILE. A floor of 2 defeated that above window_n=12: at the
-    window maximum the total reached 32 against the 24 being divided up."""
-    per_file = max(1, 24 // max(1, window_n))
-    assert window_n * per_file <= 24, f"{window_n} x {per_file} exceeds 24"
+    Above `_RANGED_GET_POOL` readers the division bottoms out at one GET each
+    and the total tracks the window, which is the operator's choice to make:
+    they asked for that many readers. What must not happen is per-file
+    concurrency staying flat while the window grows, which is what a floor of
+    2 did (32 outstanding GETs at window 16, against the 24 being divided).
+    """
+    per_file = max(1, merge_mod._RANGED_GET_POOL // window_n)
+    if window_n <= merge_mod._RANGED_GET_POOL:
+        assert window_n * per_file <= merge_mod._RANGED_GET_POOL, (
+            f"{window_n} x {per_file} exceeds {merge_mod._RANGED_GET_POOL}")
+    else:
+        assert per_file == 1, "cannot give a reader less than one GET"
 
 
 def test_zero_query_partials_are_refused_not_written_as_an_empty_file(tmp_path):
@@ -641,7 +520,7 @@ def test_a_failure_before_the_drain_does_not_strand_readers(tmp_path, monkeypatc
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     _write_partials(cfg, pdir, n_partials=6, n_queries=200)
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 2)
+                        lambda *a, **k: 2)
 
     def boom(*a, **kw):
         raise PermissionError("read-only output root")
@@ -684,7 +563,7 @@ def test_a_fold_failing_before_sl_is_bound_surfaces_the_real_error(tmp_path, mon
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     _write_partials(cfg, pdir, n_partials=6, n_queries=200)
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 2)
+                        lambda *a, **k: 2)
 
     real = Store.read_columns
     monkeypatch.setattr(Store, "read_columns",
@@ -723,29 +602,6 @@ def test_a_consumer_failure_keeps_its_location(tmp_path, monkeypatch):
     assert "merge.py" in notes, notes
 
 
-def test_variable_width_ids_do_not_collapse_the_window(tmp_path):
-    """The width estimate multiplies out the MAX bound, which for variable-width
-    ids is the single longest value in the partial -- observed far over on
-    url-shaped ids, which drives the window to one reader and tells the operator
-    to find a bigger box. Only a fixed width may be multiplied out."""
-    q, k = 200, 4
-    ids = [f"https://example.com/{'x' * (3 if i else 3000)}/{i}" for i in range(q * k)]
-    off = pa.array(np.arange(q + 1, dtype=np.int32) * k)
-    tbl = pa.table({
-        "query_id": pa.array([f"q{i}" for i in range(q)]),
-        "hit_ids": pa.ListArray.from_arrays(off, pa.array(ids, pa.large_string())),
-        "hit_scores": pa.ListArray.from_arrays(
-            off, pa.array(np.linspace(1, 0, q * k, dtype=np.float32), pa.float32())),
-    })
-    path = str(tmp_path / "p.parquet")
-    pq.write_table(tbl, path, compression="snappy")
-
-    cols = ["hit_ids", "hit_scores"]
-    est = merge_mod._hit_bytes_per_partial([pq.ParquetFile(path)], cols)
-    actual = pq.read_table(path, columns=cols).nbytes
-    assert est < actual * 8, f"estimate {est:,} is wild vs parsed {actual:,}"
-
-
 def _no_leaked_readers(before, timeout=5.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -766,7 +622,7 @@ def test_an_interrupt_in_the_drain_still_releases_every_reader(tmp_path, monkeyp
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     _write_partials(cfg, pdir, n_partials=8, n_queries=150)
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 2)
+                        lambda *a, **k: 2)
 
     real_q = merge_mod.Queue
 
@@ -796,7 +652,7 @@ def test_a_thread_that_will_not_start_still_releases_the_ones_that_did(
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     _write_partials(cfg, pdir, n_partials=6, n_queries=150)
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 2)
+                        lambda *a, **k: 2)
 
     real_start = threading.Thread.start
     state = {"n": 0}
@@ -827,7 +683,7 @@ def test_a_data_error_outranks_a_transient_read_error(tmp_path, monkeypatch):
     pdir = tmp_path / "out" / partial_dir(cfg, cfg.searches[0])
     _write_partials(cfg, pdir, n_partials=4, n_queries=100)
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 4)
+                        lambda *a, **k: 4)
 
     real = Store.read_columns
     order: list[str] = []
@@ -1039,7 +895,7 @@ def test_a_folded_partial_is_freed_before_its_window_permit_is_returned(
     one = pq.read_table(str(pdir / "rank000.parquet")).nbytes
 
     monkeypatch.setattr(merge_mod, "_merge_window",
-                        lambda r, c, n, ranged=False: 1)
+                        lambda *a, **k: 1)
     samples: list[int] = []
     real_sem = merge_mod.Semaphore
 

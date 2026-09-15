@@ -125,7 +125,7 @@ def test_explicit_batch_size_is_invariant(scenario):
 
 
 def test_reduce_bounds_how_many_partials_are_resident(scenario, monkeypatch, tmp_path):
-    """The reduce must hold at most `_MERGE_WINDOW` partials at once.
+    """The reduce must hold at most `merge_window` partials at once.
 
     This is the property the whole partial-major rewrite exists for. The old
     shape opened ALL W partials and read the same query batch from each in
@@ -156,9 +156,12 @@ def test_reduce_bounds_how_many_partials_are_resident(scenario, monkeypatch, tmp
     monkeypatch.setattr(merge_mod.Store, "read_columns", counting_read)
     merge_mod.run_merge(cfg)
 
-    assert peak <= merge_mod._MERGE_WINDOW_MAX, (
-        f"{peak} partials were resident at once; the cap is "
-        f"{merge_mod._MERGE_WINDOW_MAX}. An unbounded reduce is what OOMed at scale."
+    # NOT `_merge_window(...)` -- that makes the bound self-referential, so a
+    # mutant returning `n_partials` satisfied `peak <= 10**6` vacuously.
+    want = cfg.params.merge_window
+    assert peak <= want, (
+        f"{peak} partials were resident at once; the window is {want}. "
+        "An unbounded reduce is what OOMed at scale."
     )
     assert peak >= 1, "no partial was ever read — the test proves nothing"
 
@@ -193,57 +196,39 @@ def test_mismatched_partial_counts_across_searches_raises(scenario, tmp_path):
         run_merge(cfg)
 
 
-def test_merge_window_is_derived_from_bytes_not_a_fixed_count():
-    """The window must scale with how big a partial actually is.
+def test_merge_window_is_exactly_what_the_operator_set(monkeypatch):
+    """A plain number, clamped only by how many partials there are to read.
 
-    A fixed count is wrong in both directions: a partial for a small search and
-    one for a large dense search differ by orders of magnitude, so the same number is
-    either wasteful or an OOM. This pins the shape of the derivation rather
-    than a magic value.
+    This replaced a derivation from parquet metadata. That estimate was
+    measured 3.3x HIGH on real 32-hex ids -- collapsing the window to one
+    reader and serialising a 10B merge -- and 0.11x LOW on a column whose
+    lexicographic bounds are short but whose interior values are long. No
+    correction fixed both directions, and a wrong guess that looks
+    authoritative is worse than a number the operator chose.
     """
+    import types
     import nova_bf.merge as m
 
-    class _Col:
-        def __init__(self, path, n):
-            self.path_in_schema = path
-            self.total_uncompressed_size = n
-            self.total_compressed_size = n // 2      # raw-file term
-    class _RG:
-        def __init__(self, cols): self._c = cols; self.num_columns = len(cols)
-        def column(self, i): return self._c[i]
-    class _MD:
-        def __init__(self, rgs): self._r = rgs; self.num_row_groups = len(rgs)
-        def row_group(self, i): return self._r[i]
-    class _R:
-        def __init__(self, per_col): self.metadata = _MD([_RG([
-            _Col("hit_ids.list.element", per_col), _Col("hit_scores.list.element", per_col),
-            _Col("query", 10**9),          # payload: must NOT be counted
-        ])])
+    def _c(window):
+        return types.SimpleNamespace(params=types.SimpleNamespace(merge_window=window))
 
-    hit = ["hit_ids", "hit_scores"]
-    small = m._hit_bytes_per_partial([_R(1 << 20)], hit)      # 1 MiB per col
-    big   = m._hit_bytes_per_partial([_R(1 << 30)], hit)      # 1 GiB per col
-    # Scales with the hit columns and EXCLUDES payload (the `query` column
-    # must not appear), and is >= the encoded size because a parsed table is
-    # bigger than its dictionary-encoded form.
-    assert small >= 2 << 20, small
-    assert small < (1 << 30), "payload column leaked into the estimate"
-    assert big >= 2 << 30, big
-    assert big > small * 100, (small, big)
+    monkeypatch.delenv("NOVA_BF_MERGE_WINDOW", raising=False)
+    assert m._merge_window(_c(5), 64) == 5, "no scaling, no budget, no surprise"
+    assert m._merge_window(_c(64), 1000) == 64, (
+        "no ceiling: a window too large for the box is the operator's call")
+    assert m._merge_window(_c(1), 64) == 1
+    assert m._merge_window(_c(64), 3) == 3, "clamped to the partials present"
+    assert m._merge_window(_c(2), 1) == 1
 
-    # ranged_get adds the whole raw file on top -- it is buffered while parsing.
-    assert m._hit_bytes_per_partial([_R(1 << 20)], hit, ranged=True) > small
+    # The default applies when nothing is set, and gives read/fold overlap.
+    assert m._merge_window(_c(None), 64) == m._MERGE_WINDOW_DEFAULT
+    assert m._MERGE_WINDOW_DEFAULT >= 2, (
+        "a default of 1 removes read/fold overlap entirely")
 
-    # A tiny partial gets a deeper window than a huge one, from the same budget.
-    w_small = m._merge_window([_R(1 << 20)], hit, 64)
-    w_big   = m._merge_window([_R(8 << 30)], hit, 64)
-    assert w_small > w_big, (w_small, w_big)
-    assert w_small <= m._MERGE_WINDOW_MAX, "must stay under the concurrency cap"
-    # A partial larger than the whole budget drops to ONE reader on purpose:
-    # keeping the 2-partial overlap floor there would just double an overshoot
-    # the budget already says will not fit. Overlap is the thing worth losing.
-    assert w_big == 1, (w_big, "huge partials must not keep the overlap floor")
-    # ...but a partial that comfortably fits still gets real overlap.
-    assert m._merge_window([_R(1 << 20)], hit, 64) >= m._MERGE_WINDOW_MIN
-    # and the window never exceeds the number of partials there are to read
-    assert m._merge_window([_R(1 << 20)], hit, 1) == 1
+    # Env wins over config; an unusable env keeps the COMMITTED value rather
+    # than dropping to the default an operator set it precisely to escape.
+    monkeypatch.setenv("NOVA_BF_MERGE_WINDOW", "7")
+    assert m._merge_window(_c(4), 64) == 7
+    for bad in ("0", "-3", "2.5", "two", "  "):
+        monkeypatch.setenv("NOVA_BF_MERGE_WINDOW", bad)
+        assert m._merge_window(_c(4), 64) == 4, f"env={bad!r} discarded the config"

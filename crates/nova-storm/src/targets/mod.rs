@@ -23,6 +23,8 @@ use crate::queries::QueryVector;
 pub mod elastic;
 #[cfg(feature = "milvus")]
 pub mod milvus;
+#[cfg(feature = "opensearch")]
+pub mod opensearch;
 pub mod qdrant;
 
 /// Outcome of a single batch dispatch (one `query_batch` round-trip, covering
@@ -113,14 +115,21 @@ pub trait QueryTarget: Send + Sync + std::fmt::Display {
 }
 
 /// Target backend config, dispatched on `type:`. Each backend owns its config
-/// struct in its own module; the elastic/milvus variants are gated on the same
-/// cargo feature that pulls their SDK in (off by default).
+/// struct in its own module; the elastic/opensearch/milvus variants are gated on
+/// the same cargo feature that pulls their SDK in (off by default).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TargetConfig {
     Qdrant(qdrant::QdrantConfig),
     #[cfg(feature = "elastic")]
     Elastic(elastic::ElasticConfig),
+    // Boxed: OpenSearchConfig is the largest variant, so an unboxed one would
+    // size the whole enum to it (clippy::large_enum_variant). `rename_all =
+    // "snake_case"` would spell the tag `open_search`; OpenSearch is one word
+    // everywhere else, so the wire name is pinned.
+    #[cfg(feature = "opensearch")]
+    #[serde(rename = "opensearch")]
+    OpenSearch(Box<opensearch::OpenSearchConfig>),
     #[cfg(feature = "milvus")]
     Milvus(milvus::MilvusConfig),
 }
@@ -139,6 +148,8 @@ impl TargetConfig {
             TargetConfig::Qdrant(c) => Ok(Arc::new(c.into_target(query)?)),
             #[cfg(feature = "elastic")]
             TargetConfig::Elastic(c) => Ok(Arc::new(c.into_target(query).await?)),
+            #[cfg(feature = "opensearch")]
+            TargetConfig::OpenSearch(c) => Ok(Arc::new(c.into_target(query).await?)),
             #[cfg(feature = "milvus")]
             TargetConfig::Milvus(c) => Ok(Arc::new(c.into_target(query).await?)),
         }

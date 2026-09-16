@@ -30,8 +30,8 @@ indicatif = { workspace = true }
 # Query vectors are read from parquet (local or s3://) via DuckDB.
 duckdb = { workspace = true }
 
-# Target backends. Qdrant is always built in; elastic/milvus are optional (off by
-# default), mirroring nova-load's feature gating.
+# Target backends. Qdrant is always built in; elastic/opensearch/milvus are
+# optional (off by default), mirroring nova-load's feature gating.
 qdrant-client = { workspace = true }
 # Datetime range filters: RFC3339 query-file values -> the Timestamp qdrant's
 # gRPC DatetimeRange carries. The Timestamp type itself comes from
@@ -43,6 +43,7 @@ qdrant-client = { workspace = true }
 time = { version = "0.3", features = ["parsing", "formatting"] }
 elasticsearch = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
+opensearch = { workspace = true, optional = true }
 milvus = { workspace = true, optional = true }
 # The milvus target reads index-build progress + issues cosine searches over
 # Milvus's REST API (the Rust SDK's MetricType enum has no COSINE); pulled in
@@ -52,6 +53,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [features]
 default = []
 elastic = ["dep:elasticsearch", "dep:url"]
+opensearch = ["dep:opensearch", "dep:url"]
 milvus = ["dep:milvus", "dep:reqwest"]
 
 [dev-dependencies]

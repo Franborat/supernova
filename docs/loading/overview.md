@@ -318,15 +318,24 @@ across backends** — each vector store accounts for indexing time differently, 
 `index_seconds` as a within-backend signal (e.g. comparing index/quantization variants
 on the same store via `reindex`), not an apples-to-apples cross-system benchmark:
 
-- **Qdrant / Milvus** — `index_seconds` is a distinct *post-upload* index build, timed
-  directly (Qdrant defers HNSW during load then builds it in one pass; Milvus builds the
-  index after inserting). Milvus additionally logs a separate `load_seconds` for pulling
-  the built index into memory — a step Qdrant and Elasticsearch have no equivalent of.
+- **Qdrant / Milvus / OpenSearch** — `index_seconds` is a distinct *post-upload* index
+  build, timed directly (Qdrant defers HNSW during load then builds it in one pass;
+  Milvus builds the index after inserting; OpenSearch suppresses ANN structure building
+  with `index.knn.advanced.approximate_threshold: -1` during the load, then force-merges
+  to build them, which is what the post-load window measures). Milvus additionally logs a
+  separate `load_seconds` for pulling the built index into memory — a step the others have
+  no equivalent of.
 - **Elasticsearch** — builds the HNSW graph *inline during ingestion*, so there is no
   separate build phase to time. `index_seconds` there is Elasticsearch's own `index_time`
   stat (a fused ingest+build figure); the parenthetical `merge-settle` is only how long
   the post-load wait for background merges took (usually ~0). The ingestion cost itself
   shows up in the loader's throughput lines (`… pts/s`).
+
+Note the OpenSearch / Elasticsearch split above is a real behavioural difference, not a
+naming one: OpenSearch exposes a dynamic setting that suppresses vector-structure building
+per segment, so the build can be deferred and timed the way Qdrant's is. Elasticsearch has
+no equivalent knob, so its graph cost is unavoidably fused into ingestion. Two otherwise
+similar Lucene-based stores therefore report `index_seconds` that mean different things.
 
 ## Backpressure: timeouts, retries, and rate limiting
 

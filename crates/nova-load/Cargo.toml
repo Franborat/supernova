@@ -39,9 +39,11 @@ indicatif = { workspace = true }
 qdrant-client = { workspace = true }
 duckdb = { workspace = true }
 
-# Optional load backends — off by default, enabled with `--features elastic,milvus`.
+# Optional load backends — off by default, enabled with
+# `--features elastic,opensearch,milvus`.
 elasticsearch = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
+opensearch = { workspace = true, optional = true }
 milvus = { workspace = true, optional = true }
 # The milvus backend polls index-build progress (pending_index_rows) over
 # Milvus's REST API, because the gRPC SDK's bundled proto is too old to carry
@@ -51,6 +53,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 [features]
 default = []
 elastic = ["dep:elasticsearch", "dep:url"]
+opensearch = ["dep:opensearch", "dep:url"]
 milvus = ["dep:milvus", "dep:reqwest"]
 
 [dev-dependencies]

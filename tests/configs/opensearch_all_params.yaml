@@ -1,0 +1,72 @@
+# Coverage fixture: exercises every index param the opensearch loader currently
+# supports, so the coverage test in
+# `crates/nova-load/src/stores/opensearch.rs` can assert each one flows through
+# into the create-index request.
+#
+# Keep this in sync with `VectorSpec` (per-vector knobs) and `OpenSearchParams`
+# (index-wide knobs): a new param should gain a line here AND an assertion in
+# `all_index_params_flow_through`. Same pairing as the qdrant fixture next to it.
+#
+# Dense-only by design: the opensearch backend rejects sparse and multivector
+# specs at mapping-build time (see `non_dense_vectors_are_rejected`), so unlike
+# the qdrant fixture there is no sparse/multivector vector here.
+
+loader:
+  batch_size: 256
+  concurrency: 4
+
+datasource:
+  type: local
+  path: /tmp/parquet
+
+vectors:
+  # Dense vector with every per-vector knob this backend reads.
+  # NOTE: `datatype: float16` and `uint8` are deliberately absent — OpenSearch
+  # has no 16-bit element type (that is the faiss `sq` encoder, configured under
+  # params.method.encoder below) and its `byte` is signed, so both are rejected
+  # with a pointed error rather than silently mapped onto a near-miss.
+  dense:
+    type: dense
+    column: dense_embedding
+    size: 384
+    distance: cosine
+    datatype: float32
+    on_disk: true          # selects `mode` unless params.mode overrides it
+
+vectorstore:
+  type: opensearch
+  url: https://localhost:9200
+  index_name: everything
+  username: admin
+  password: secret
+  tls_insecure: true
+  # Per-request timeout in seconds (default 120; a short client timeout
+  # amplifies backpressure rather than surviving it — see the qdrant fixture).
+  timeout_s: 240
+  params:
+    recreate: true
+    # Static settings — settable only at index creation.
+    shards: 3
+    # Dynamic settings — `nova load reindex` can patch these in place.
+    replicas: 1
+    refresh_interval: 30s
+    ef_search: 200               # index.knn.algo_param.ef_search
+    # Vector storage shape. IMMUTABLE after creation, like the method below.
+    mode: on_disk
+    compression_level: 16x
+    # The ANN method. Every field of it is immutable after index creation, so a
+    # `reindex` that asks to change one is refused rather than silently doing
+    # nothing. Knobs are flat here and re-nested under `parameters` on the wire.
+    method:
+      name: hnsw
+      engine: faiss
+      m: 16
+      ef_construction: 256
+      ef_search: 128             # the mapping-level default, distinct from the
+                                 # index setting above; a query's own
+                                 # method_parameters.ef_search overrides both
+      encoder:
+        name: sq
+        type: fp16
+        bits: 16
+        clip: true

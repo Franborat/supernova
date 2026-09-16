@@ -9,8 +9,9 @@
 #
 # Prints a latency summary (requests, errors, throughput, p50/p95/p99, max).
 
-# The cluster under test, dispatched on `type` — `qdrant` (always available),
-# or `milvus` / `elastic` (feature-gated: build with `--features elastic,milvus`).
+# The cluster under test, dispatched on `type` — `qdrant` (always available), or
+# `milvus` / `elastic` / `opensearch` (feature-gated: build with
+# `--features elastic,opensearch,milvus`).
 target:
   type: qdrant
   url: ${QDRANT_URL}                # env substitution; ${VAR:-default} also works
@@ -18,8 +19,8 @@ target:
   collection_name: fiqa_bge-m3
 
   # --- Or one of the other backends (replace the `qdrant` block above). For
-  # milvus/elastic, `query.vector_name` is REQUIRED (the vector field to search)
-  # and `query.filter` is NOT yet supported (qdrant only).
+  # milvus/elastic/opensearch, `query.vector_name` is REQUIRED (the vector field
+  # to search) and `query.filter` is NOT yet supported (qdrant only).
   #
   # type: milvus
   # url: http://localhost:19530       # gRPC + REST share this endpoint (2.4+)
@@ -37,11 +38,21 @@ target:
   # username: elastic                 # or `api_key: <base64 id:api_key>`; optional
   # password: my-password
   # tls_insecure: false               # true only for a self-signed dev node
+  #
+  # type: opensearch
+  # url: https://localhost:9200
+  # index_name: fiqa_bge-m3
+  # username: admin                   # or `bearer_token: <jwt>`; optional
+  # password: my-password
+  # tls_insecure: true                # a default node serves a self-signed cert
+  #   Reports per-result scores and reads its own `space_type`, so tie-aware
+  #   recall works here as it does on qdrant (see docs/storm/recall.md).
 
 # What to search with.
 query:
   # Named vector to hit. Omit for a single-(unnamed-)vector Qdrant collection;
-  # REQUIRED for milvus (the annsField) and elastic (the dense_vector field).
+  # REQUIRED for milvus (the annsField), elastic (the dense_vector field) and
+  # opensearch (the knn_vector field).
   vector_name: dense
   top_k: 10                         # neighbours per query (default 10)
   # A ground truth DEEPER than top_k is truncated to its first top_k ids at
@@ -67,6 +78,9 @@ query:
   #   qdrant:  { hnsw_ef: 128, exact: false, quantization: { rescore: true, oversampling: 2.0 } }
   #   milvus:  { ef: 128 }       # HNSW; or { nprobe: 32 } for IVF — not both
   #   elastic: { num_candidates: 128 }   # per-shard HNSW candidate pool, must be >= top_k
+  #   opensearch: { ef_search: 128 }     # HNSW candidate pool, must be >= top_k; or
+  #                                      #   { nprobes: 32 } on an IVF index, plus an
+  #                                      #   optional { rescore: { oversample_factor: 2.0 } }
   # search_params:
   #   hnsw_ef: 128
   source:

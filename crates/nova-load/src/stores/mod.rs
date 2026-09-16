@@ -1,6 +1,8 @@
 mod qdrant;
 #[cfg(feature = "elastic")]
 mod elastic;
+#[cfg(feature = "opensearch")]
+mod opensearch;
 #[cfg(feature = "milvus")]
 mod milvus_store;
 
@@ -20,6 +22,15 @@ use crate::config::VectorSpec;
 pub enum StoreError {
     #[error(transparent)]
     Qdrant(Box<qdrant_client::QdrantError>),
+    /// An OpenSearch failure, keeping the HTTP status when the response carried
+    /// one so [`StoreError::is_retryable`] can classify it instead of falling
+    /// into the assume-transient `Other` bucket.
+    #[cfg(feature = "opensearch")]
+    #[error("{message}")]
+    OpenSearch {
+        status: Option<u16>,
+        message: String,
+    },
     /// Backend-agnostic failure, e.g. an existing collection whose config
     /// conflicts with the requested one.
     #[error("{0}")]
@@ -50,6 +61,17 @@ impl StoreError {
                 ),
                 _ => true,
             },
+            // HTTP: retry only what a retry could plausibly fix. 429
+            // (too many requests) and 502/503/504 are backpressure or a
+            // momentarily unavailable node; a 4xx request/auth/mapping problem
+            // would only burn the retry budget re-sending what the server
+            // already rejected. A status-less error is a transport failure
+            // (connection reset, timeout) — transient.
+            #[cfg(feature = "opensearch")]
+            StoreError::OpenSearch { status, .. } => match status {
+                Some(code) => matches!(code, 429 | 502 | 503 | 504),
+                None => true,
+            },
             StoreError::Other(_) => true,
         }
     }
@@ -66,6 +88,15 @@ pub enum VectorStoreConfig {
     Qdrant(Box<qdrant::QdrantConfig>),
     #[cfg(feature = "elastic")]
     Elastic(elastic::ElasticConfig),
+    // Boxed for the same reason as Qdrant: OpenSearchConfig carries a nested
+    // `params` block (method + encoder sub-configs), so an unboxed variant would
+    // size the whole enum to it.
+    // `rename_all = "snake_case"` would spell this `open_search`; OpenSearch is
+    // one word everywhere else (the crate, the product, the feature flag), so
+    // the wire name is pinned.
+    #[cfg(feature = "opensearch")]
+    #[serde(rename = "opensearch")]
+    OpenSearch(Box<opensearch::OpenSearchConfig>),
     #[cfg(feature = "milvus")]
     Milvus(milvus_store::MilvusConfig),
 }
@@ -80,6 +111,8 @@ impl VectorStoreConfig {
             VectorStoreConfig::Qdrant(c) => Ok(Box::new(c.connect().await?)),
             #[cfg(feature = "elastic")]
             VectorStoreConfig::Elastic(c) => Ok(Box::new(c.connect().await?)),
+            #[cfg(feature = "opensearch")]
+            VectorStoreConfig::OpenSearch(c) => Ok(Box::new(c.connect().await?)),
             #[cfg(feature = "milvus")]
             VectorStoreConfig::Milvus(c) => Ok(Box::new(c.connect().await?)),
         }
@@ -309,5 +342,27 @@ mod tests {
         }
         // No status to inspect → assume transient (other backends' behavior).
         assert!(StoreError::Other("bulk upsert failed".into()).is_retryable());
+    }
+
+    /// The same rule for HTTP backends: backpressure and momentary
+    /// unavailability retry; a request/auth/mapping rejection must NOT, or a
+    /// single malformed batch burns the whole `upsert_retries` budget
+    /// re-sending what the server already refused.
+    #[cfg(feature = "opensearch")]
+    #[test]
+    fn retryability_follows_http_status() {
+        let err = |status: Option<u16>| StoreError::OpenSearch {
+            status,
+            message: "bulk upsert failed".into(),
+        };
+        for transient in [429, 502, 503, 504] {
+            assert!(err(Some(transient)).is_retryable(), "{transient}");
+        }
+        for fatal in [400, 401, 403, 404, 409, 413] {
+            assert!(!err(Some(fatal)).is_retryable(), "{fatal}");
+        }
+        // A transport failure (connection reset, client timeout) carries no
+        // status → assume transient, same as `Other`.
+        assert!(err(None).is_retryable());
     }
 }

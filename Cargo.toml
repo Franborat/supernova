@@ -49,6 +49,13 @@ elasticsearch = "=8.15.0-alpha.1"
 # The maintained community SDK; its lib name is `milvus`, so `use milvus::…` is
 # unchanged. (The similarly-named `milvus` crate is a different, unbuildable one.)
 milvus = { package = "milvus-sdk-rust", version = "0.1.0" }
+# The official OpenSearch client — a fork of `elasticsearch-rs`, so the transport
+# layer (TransportBuilder, Credentials, BulkOperation, MsearchParts, …) reads the
+# same; only the kNN mapping and query DSL differ. `default-features = false`
+# drops its default `native-tls` in favour of rustls, matching every other TLS
+# user in this workspace. It pulls reqwest 0.13, the same major qdrant-client
+# already brings in — no extra duplicated tree.
+opensearch = { version = "2.4", default-features = false, features = ["rustls-tls"] }
 
 
 # dev dependencies for workspace

@@ -124,9 +124,11 @@ nova storm <config> [--json]
 ```
 
 The target backend is chosen by the config's `target.type` — `qdrant` (always
-built in) or `milvus` / `elastic` (build with `--features elastic,milvus`).
-`milvus`/`elastic` require `query.vector_name` (the vector field) and don't yet
-support `query.filter`; `search_params` are validated per backend. See
+built in) or `milvus` / `elastic` / `opensearch` (build with
+`--features elastic,opensearch,milvus`; `make storm STORM_FEATURES=...` does the
+same for an install). Those three require `query.vector_name` (the vector field)
+and don't yet support `query.filter`; `search_params` are validated per backend
+(`{ef_search, nprobes, rescore}` for opensearch). See
 `configs/storm/example.yaml`.
 
 The config's `load` block picks the mode:
@@ -138,7 +140,8 @@ The config's `load` block picks the mode:
 
 `batch_size` (default `1`) is how many query vectors go in each dispatch (one
 batched round-trip per dispatch — Qdrant `query_batch`, Milvus batched search,
-or an Elasticsearch `_msearch`) — not a special case at `1`, just the default.
+or an Elasticsearch/OpenSearch `_msearch`) — not a special case at `1`, just the
+default.
 `rps` paces *dispatches*, not individual queries.
 
 Prints a latency summary at the end: requests/errors (dispatch counts),
@@ -254,7 +257,8 @@ nova sweep <config.yaml> [--skip-insert] [--cleanup] [--dry-run]
 ```
 
 - `target.type` is **required** and selects the backend: `qdrant`, `milvus`,
-  or `elastic` (same three as `nova-load`/`nova-storm`). Each carries its own
+  or `elastic`. (`nova-load`/`nova-storm` additionally support `opensearch`;
+  `nova sweep` has no adapter for it yet.) Each carries its own
   `target:` fields and search-param vocabulary (`{hnsw_ef, exact,
   quantization}` / `{ef, nprobe}` / `{num_candidates}`); see the Sweep
   overview's "Target backends" section.

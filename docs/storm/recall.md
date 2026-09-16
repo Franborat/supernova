@@ -91,13 +91,20 @@ bounds is tie-break disagreement.
 Without a score column the bounds collapse to one number — the historical
 behavior.
 
-!!! note "Qdrant only, for now"
-    Only the Qdrant target reports per-result scores and can describe its own
-    collection. Milvus and Elastic use the default `scoring_profile()`, so
-    their distance function is unknown and tie reporting is **disabled** with
-    that reason — exact recall is unaffected. Left that way deliberately: Milvus returns *distances*
-    for L2 (ascending, not descending similarity), and guessing the sign
-    convention would silently mis-call ties rather than fail loudly.
+!!! note "Qdrant and OpenSearch only, for now"
+    The Qdrant and OpenSearch targets report per-result scores and can describe
+    their own collection, so tie-aware bounds work on both. OpenSearch qualifies
+    because every space type it supports scores *higher-is-better* (they are all
+    documented monotone transforms of distance — `1/(1+d)` and friends), and the
+    `space_type` is readable straight off the field mapping, so the orientation
+    is known rather than assumed; an unrecognized space maps to `None` and
+    disables tie reporting rather than guessing.
+
+    Milvus and Elastic use the default `scoring_profile()`, so their distance
+    function is unknown and tie reporting is **disabled** with that reason —
+    exact recall is unaffected. Left that way deliberately: Milvus returns
+    *distances* for L2 (ascending, not descending similarity), and guessing the
+    sign convention would silently mis-call ties rather than fail loudly.
 
 ## `tie_epsilon`
 

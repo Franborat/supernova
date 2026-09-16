@@ -997,13 +997,13 @@ mod tests {
     }
 
     fn qdrant_store(cfg: &LoadConfig) -> &QdrantConfig {
-        // Was irrefutable when Qdrant was the only variant. The elastic/milvus
-        // features add variants; the wildcard arm is gated on them so this stays
-        // an exhaustive, warning-free match whether or not those features are on.
-        // (These tests are Qdrant-only.)
+        // Was irrefutable when Qdrant was the only variant. The
+        // elastic/opensearch/milvus features add variants; the wildcard arm is
+        // gated on them so this stays an exhaustive, warning-free match whether
+        // or not those features are on. (These tests are Qdrant-only.)
         match &cfg.vectorstore {
             VectorStoreConfig::Qdrant(store) => store.as_ref(),
-            #[cfg(any(feature = "elastic", feature = "milvus"))]
+            #[cfg(any(feature = "elastic", feature = "opensearch", feature = "milvus"))]
             _ => panic!("test fixture must be a qdrant vectorstore"),
         }
     }

@@ -83,7 +83,39 @@ vectorstore:
   #   # pre_create: [tenant_a, tenant_b]           # create up front in `prepare`
 
 # Other backends are compiled in only with the matching cargo feature:
-#   cargo build -p nova-load --features elastic,milvus
+#   cargo build -p nova-load --features elastic,opensearch,milvus
+#
+# OpenSearch (feature `opensearch`) — dense vectors + payload. Sparse/multivector
+# are not supported. Auth: username/password OR a bearer (JWT) token; OpenSearch
+# has no Elasticsearch-style encoded api_key. Per-vector `distance` becomes the
+# field's `space_type` (cosine -> cosinesimil, dot -> innerproduct, euclid -> l2,
+# manhattan -> l1) and `on_disk` becomes the vector `mode`, so the same `vectors:`
+# block above carries over unchanged.
+# vectorstore:
+#   type: opensearch
+#   url: https://localhost:9200        # a default node is HTTPS + self-signed
+#   index_name: mteb_tweets
+#   username: admin
+#   password: ${OPENSEARCH_PASSWORD}   # or `bearer_token: ${OPENSEARCH_JWT}`
+#   tls_insecure: true                 # DEV ONLY (self-signed node cert)
+#   timeout_s: 120
+#   params:
+#     recreate: false
+#     shards: 3                        # static — creation only
+#     replicas: 1                      # dynamic — `nova load reindex` can patch
+#     refresh_interval: 30s            # dynamic; the load forces -1 regardless
+#     ef_search: 200                   # dynamic (index.knn.algo_param.ef_search)
+#     # IMMUTABLE after creation — OpenSearch cannot change any of these in
+#     # place, so sweep them with a fresh load, never `nova load reindex`.
+#     mode: on_disk                    # in_memory | on_disk
+#     compression_level: 16x           # 1x | 2x | 4x | 8x | 16x | 32x
+#     method:
+#       name: hnsw                     # hnsw | ivf | flat | disk_ann
+#       engine: faiss                  # faiss (default) | lucene | nmslib | jvector
+#       m: 16
+#       ef_construction: 256
+#       # encoder: {name: sq, type: fp16, bits: 16}   # 16-bit storage lives HERE,
+#       #   not in the vector `datatype` — OpenSearch has no fp16 element type.
 #
 # Elasticsearch (feature `elastic`) — dense vectors + payload. Sparse/multivector
 # are not supported. Auth: username/password OR a base64 api_key.

@@ -90,7 +90,6 @@ def _print_dry_run(cfg, config_path: str, source_dict: dict, num_jobs: int | Non
     click.echo("=" * 70)
 
 
-@click.command(name="run", help="Embed a dataset locally (the default command).")
 def _print_file_partition(source, jobs: int, num_jobs: int | None) -> None:
     """Dry-run partition for a file-sharded source: files per rank, no download."""
     files = [p for p, _ in source.list_files()]
@@ -115,6 +114,49 @@ def _print_file_partition(source, jobs: int, num_jobs: int | None) -> None:
             f"\n  ⚠  {empty} job(s) receive 0 files — num_jobs ({num_jobs}) exceeds the "
             f"file count ({n}); reduce it."
         )
+
+
+def _widen_arrow_decode_pool() -> None:
+    """Undo a GPU launcher's OMP_NUM_THREADS=1 clamp on pyarrow's decode pool.
+
+    Ray -- and so SkyPilot -- sets OMP_NUM_THREADS to the CPU count it gave the
+    task, which is ONE for a task that only asked for a GPU (every embed yaml
+    asks for `accelerators: A10G:1`). pyarrow sizes its GLOBAL CPU pool from
+    that, so `read_row_group` in the parquet source decodes single-threaded.
+
+    Steps in only when the pool's width is ATTRIBUTABLE to the launcher: it
+    equals OMP_NUM_THREADS and sits below what this process can use. Not "is it
+    exactly 1" -- Ray sets the variable to the task's CPU allocation, so a task
+    asking for `cpus: 4` alongside the GPU gets 4, and keying on 1 would miss it
+    silently. A width that does not match OMP_NUM_THREADS was chosen by somebody
+    and is left alone. (nova-bf's `_unclamp_decode_threads` uses the same rule;
+    it also reads the cgroup quota, which nova-embed cannot without depending on
+    nova-bf, so this uses `min(cpu_count, sched_getaffinity)`.)
+    """
+    try:
+        import pyarrow as pa
+
+        n = os.cpu_count() or 1
+        try:
+            n = min(n, len(os.sched_getaffinity(0)))
+        except (AttributeError, OSError):    # not Linux, or not permitted
+            pass
+        omp = os.environ.get("OMP_NUM_THREADS", "").strip()
+        try:
+            clamped = bool(omp) and int(omp) == pa.cpu_count() < n
+        except ValueError:                   # a float or the "outer,inner" form
+            clamped = False
+        if not clamped:
+            return
+        pa.set_cpu_count(n)
+        logging.getLogger("nova_embed").info(
+            "pyarrow decode pool was clamped to %s thread(s) by "
+            "OMP_NUM_THREADS; raised to %d",
+            os.environ.get("OMP_NUM_THREADS", "<unset>"), n,
+        )
+    except Exception as exc:                 # noqa: BLE001 - never fail a run
+        logging.getLogger("nova_embed").warning(
+            "could not raise pyarrow's decode pool: %s", exc)
 
 
 @click.command(name="run", help="Embed a dataset locally.")
@@ -152,6 +194,8 @@ def embed(config, num_jobs, job_rank, dry_run):
         raise click.UsageError(
             "Provide a config path as argument or set NOVA_CONFIG_PATH env var"
         )
+
+    _widen_arrow_decode_pool()
 
     cfg = load_config(config_path)
     pipeline = cfg.pipeline

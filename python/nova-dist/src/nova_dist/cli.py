@@ -225,15 +225,30 @@ def bf_compute(config, resources, num_jobs, pool_name, dry_run):
     if not dry_run:
         click.echo("\nwhen all workers finish, merge the partials:")
         click.echo(f"  nova dist bf merge {config}")
+        click.echo("  (add -j2 to overlap searches; each job is its own process "
+                   "with its own merge_window of partials AND its own full-width "
+                   "decode pool, so both RSS and CPU multiply by N)")
 
 
 @bf.command("merge")
 @click.argument("config")
-def bf_merge(config):
+@click.option("--jobs", "-j", type=int, default=1, metavar="N",
+              help="Reduce up to N searches concurrently. BOTH memory and CPU "
+                   "scale with N: each job is its own process holding its own "
+                   "`params.merge_window` of partials and its own full-width "
+                   "Arrow decode pool.")
+@click.option("--search", "searches", multiple=True,
+              help="Reduce only these searches (repeatable). Every search is "
+                   "still validated; one manifest is written per search.")
+def bf_merge(config, jobs, searches):
     """
     Merge per-rank partial results into each search's own top-K parquet (runs on the controller).
     """
-    _run_local("nova-bf", ["merge", config])
+    # Forward BOTH, and forward `--jobs` unconditionally. `nova-bf merge`
+    args = ["merge", config, "--jobs", str(jobs)]
+    for name in searches:
+        args += ["--search", name]
+    _run_local("nova-bf", args)
 
 
 if __name__ == "__main__":

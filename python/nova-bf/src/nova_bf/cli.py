@@ -29,7 +29,7 @@ def main() -> None:
 @click.option("--job-rank", type=int, default=None, help="This worker's rank; defaults to $SKYPILOT_JOB_RANK.")
 @click.option("--io-workers", type=int, default=None, help="Override params.io_workers — concurrent corpus-file reader threads (for sweeping/tuning).")
 @click.option("--io-thread-count", type=int, default=None, help="Override params.io_thread_count — pyarrow's global IO pool (true S3 fetch concurrency).")
-@click.option("--cpu-thread-count", type=int, default=None, help="Override params.cpu_thread_count — pyarrow's global CPU pool (parquet decode + Arrow compute kernels; the OTHER pool from --io-thread-count, which only fetches bytes).")
+@click.option("--cpu-thread-count", type=int, default=None, help="Override params.cpu_thread_count — the run's CPU width. Sizes pyarrow's global CPU pool (parquet decode + Arrow compute kernels), torch's intra-op pool, and the text-scan pool; the OTHER pool from --io-thread-count, which only fetches bytes. Lowering it to bound Arrow memory narrows the other two as well.")
 @click.option("--max-files", type=int, default=None, help="Read only the first N corpus files of this slice. Benchmarking aid; output is PARTIAL.")
 def compute(
     config: str,

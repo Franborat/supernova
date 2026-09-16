@@ -1391,12 +1391,17 @@ def test_the_density_probe_sees_every_row_not_just_the_first_batch(
     pdir = root / partial_dir(cfg, cfg.searches[0])
     pdir.mkdir(parents=True)
 
-    # PAST THE PROBE BATCH. `probe_rows` is
-    # `max(256, min(8192, 2_000_000 // k))`, which at k=4 is 8192 -- so a
-    # 2000-row fixture is ONE batch and the first-batch-only probe it is meant
-    # to catch gets the same answer as the streaming one. Verified: at
-    # n_full=1500 both say `arrow`; at n_full=9000 the unfixed probe says
-    # `device lanes` and the fixed one says `arrow`.
+    # NOTE (2026-09-16): the prefetch this was written against is gone --
+    # `lanes_mode` now comes from the first partial the reduce fetches, via
+    # `_decide_lanes`. "Batches" are now SLICES, and the sizing below still
+    # works: `probe_rows` is `max(256, min(8192, 2_000_000 // k))` = 8192 at
+    # k=4, so 9500 rows split [8192, 1308] and the 500 short rows (9000..9499)
+    # sit entirely in the SECOND slice. DO NOT SHRINK `n_full` below 8192 --
+    # at 2000 rows this becomes one slice, a head-only scan reaches the same
+    # answer, and the test silently stops guarding the thing it is named for.
+    # This is the only END-TO-END cover for that property (a real `run_merge`
+    # over real files); the unit-level version, with a multi-chunk fixture that
+    # does not depend on the sizing, is in tests/test_decode_pool_and_lanes.py.
     n_full, n_short = 9000, 500
     qids = [f"q{i}" for i in range(n_full + n_short)]
     ids, scores = [], []

@@ -52,12 +52,134 @@ from nova_bf.results import (
 )
 
 logger = logging.getLogger(__name__)
+def _unclamp_decode_threads(cfg: BruteForceConfig) -> None:
+    """Undo a launcher's OMP_NUM_THREADS clamp on PyArrow's decode pool.
+
+    Ray/SkyPilot may set OMP_NUM_THREADS to the task's requested CPUs, often 1
+    for GPU-only tasks. PyArrow inherits this for its global CPU pool, making
+    reduce decoding single-threaded even when more CPUs are available.
+
+    `_usable_cpu_count()` respects affinity and cgroup quotas, so widening is
+    limited to this process's actual CPU allocation.
+
+    Without an explicit `cpu_thread_count`, only pools attributable to
+    OMP_NUM_THREADS are widened; deliberate Arrow pool settings are preserved.
+    """
+    from nova_bf.compute import _usable_cpu_count  # deferred: import cycle
+
+    want = cfg.params.cpu_thread_count
+    if not want or want <= 0:
+        usable = _usable_cpu_count()
+
+        # Widen only when Arrow matches the launcher's OMP_NUM_THREADS clamp.
+        # A different width is treated as an intentional operator setting.
+        omp = os.environ.get("OMP_NUM_THREADS", "").strip()
+        try:
+            clamped = bool(omp) and int(omp) == pa.cpu_count() < usable
+        except ValueError:
+            # Nested or otherwise non-integer OMP values cannot be matched
+            # reliably; preserve the current pool and make that visible.
+            clamped = False
+            if pa.cpu_count() < usable:
+                logger.warning(
+                    "OMP_NUM_THREADS=%r is not a plain integer, so the decode "
+                    "pool cannot be matched against it; leaving it at %d of %d "
+                    "usable CPUs. Set params.cpu_thread_count to widen it.",
+                    omp, pa.cpu_count(), usable,
+                )
+
+        if not clamped:
+            return
+        want = usable
+
+    if want == pa.cpu_count():
+        return
+
+    try:
+        pa.set_cpu_count(want)
+    except Exception as exc:  # noqa: BLE001 - never fail a merge
+        logger.warning("could not set pyarrow's decode pool to %d: %s", want, exc)
+        return
+
+    logger.info(
+        "pyarrow decode pool -> %d thread(s) for the reduce "
+        "(OMP_NUM_THREADS=%s, usable CPUs=%d)",
+        want,
+        os.environ.get("OMP_NUM_THREADS", "<unset>"),
+        _usable_cpu_count(),
+    )
+
+def _decide_lanes(tbl, spec) -> bool:
+    """Choose the ID representation from an already-decoded partial."""
+    from nova_bf.tiebreak import _NO_GPU_ORDINALS, _fixed_width
+
+    try:
+        # Bound each probe: a 100k-query partial may be a single Arrow chunk,
+        # and `_fixed_width` uses `np.diff`, which allocates an int64 array.
+        probe_rows = max(256, min(8192, 2_000_000 // max(1, spec.k)))
+        min_len, n_seen, W = None, 0, None
+
+        for col in _sliced(tbl.column("hit_ids"), probe_rows):
+            if len(col) == 0:
+                continue
+
+            lens = col.value_lengths().to_numpy(zero_copy_only=False)
+            n_seen += len(lens)
+            bmin = int(lens.min())
+            min_len = bmin if min_len is None else min(min_len, bmin)
+
+            if min_len < spec.k:
+                break  # Not dense; device fold cannot apply.
+
+            # `_fixed_width` inspects offsets only; character data is untouched.
+            bw = _fixed_width([col.flatten()])
+            if bw is None or (W is not None and bw != W):
+                W = None
+                break
+            W = bw
+
+        # Device fold requires full-k rows and fixed-width IDs.
+        dense = n_seen > 0 and min_len == spec.k
+        if not dense:
+            logger.info(
+                "search=%r: partial rows are not all k=%d hits (min %d), so "
+                "the device fold cannot apply; keeping ids on Arrow",
+                spec.name,
+                spec.k,
+                min_len if min_len is not None else 0,
+            )
+
+        return (
+            dense
+            and W is not None
+            and not os.environ.get(_NO_GPU_ORDINALS)
+        )
+
+    except Exception as exc:  # noqa: BLE001 - must never fail a merge
+        # Arrow fallback is correct; log failures so fast-path regressions show.
+        logger.warning(
+            "search=%r: the id density check failed (%s: %s); keeping ids "
+            "on Arrow. The merge is correct but the device fold is off.",
+            spec.name,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
+def _sliced(column, rows: int):
+    """Yield zero-copy slices of at most `rows` across Arrow chunks."""
+    for chunk in column.chunks:
+        for off in range(0, len(chunk), rows):
+            yield chunk.slice(off, rows)
+
 
 # How many partials may be read into memory at once.
 _MERGE_WINDOW_DEFAULT = 2
 # Concurrent range GETs per in-flight partial are this divided by the window,
 # because `_ranged_download` builds its own pool PER FILE.
 _RANGED_GET_POOL = 24
+
 def _merge_window(cfg, n_partials: int) -> int:
     """Return the number of partials to keep in flight.
 
@@ -1067,6 +1189,8 @@ def run_merge(cfg: BruteForceConfig, only: set[str] | None = None) -> dict[str, 
     `only` restricts which searches are reduced, not which are validated, so
     cross-search consistency checks still see the complete run.
     """
+    _unclamp_decode_threads(cfg)
+
     # Validate the requested search names before any storage I/O.
     if only is not None:
         unknown = only - {s.name for s in cfg.searches}
@@ -1695,56 +1819,13 @@ def _reduce(
 
     ranged = bool(cfg.params.merge_ranged_reads)
     window_n = _merge_window(cfg, len(partials))
-    # Keep one ID representation for the running state throughout the search:
-    # `lanes_mode` true means `state[bi]` ids are always `_LazyIds`, false means
-    # always a `pa.ListArray`. Deciding per fold would make every path handle
-    # both.
+    # Keep one ID representation for the running state throughout the search.
+    lanes_eligible = not want_tie and _fold_device() is not None
     lanes_mode = False
-    if not want_tie and _fold_device() is not None:
-        from nova_bf.tiebreak import _NO_GPU_ORDINALS, _fixed_width
-        try:
-            # Stream the full ID column so later short rows cannot be missed,
-            # without materializing the whole column at once: density is a
-            # MINIMUM over rows, so a first batch that happens to be full-k
-            # would call a partial dense when its later rows are short.
-            # Bound the probe by roughly 2M IDs rather than a fixed row count.
-            probe_rows = max(256, min(8192, 2_000_000 // max(1, spec.k)))
-            min_len, n_seen, W = None, 0, None
-            for batch in readers[0].iter_batches(batch_size=probe_rows,
-                                                 columns=["hit_ids"]):
-                col = batch.column("hit_ids")
-                if len(col) == 0:
-                    continue
-                lens = col.value_lengths().to_numpy(zero_copy_only=False)
-                n_seen += len(lens)
-                bmin = int(lens.min())
-                min_len = bmin if min_len is None else min(min_len, bmin)
-                if min_len < spec.k:
-                    break               # already not dense; stop reading
-                # Offsets only (see `_fixed_width`); no character data touched.
-                bw = _fixed_width([col.flatten()])
-                if bw is None or (W is not None and bw != W):
-                    W = None
-                    break
-                W = bw
-            # The device fold requires both full-k rows and fixed-width IDs.
-            # A filtered search has short rows by construction, and enabling
-            # lane state there only pays conversions for a path that cannot run.
-            dense = n_seen > 0 and min_len == spec.k
-            lanes_mode = (dense and W is not None
-                          and not os.environ.get(_NO_GPU_ORDINALS))
-            if not dense:
-                logger.info(
-                    "search=%r: partial rows are not all k=%d hits (min %d), so "
-                    "the device fold cannot apply; keeping ids on Arrow",
-                    spec.name, spec.k, min_len if min_len is not None else 0)
-        except Exception:
-            lanes_mode = False           # unreadable probe: stay on Arrow
-        finally:
-            # Release the final decoded probe batch before the reduce starts;
-            # otherwise it stays bound as a local for the whole reduce.
-            batch = col = lens = None
-    logger.info("merge state ids: %s", "device lanes" if lanes_mode else "arrow")
+    lanes_decided = not lanes_eligible
+    if not lanes_eligible:
+        logger.info("merge state ids: arrow")
+
     inputs_forced = _inputs_forced(readers)
     # Divide ranged-read concurrency across in-flight partials. The pool is a
     # budget, not a ceiling: a window wider than the pool still gives each
@@ -1831,6 +1912,13 @@ def _reduce(
                 del tbl
                 window.release()
                 continue
+            # Fix the id representation from the first partial to arrive, before
+            # anything is folded, so every fold in this search sees one setting.
+            if not lanes_decided:
+                lanes_mode = _decide_lanes(tbl, spec)
+                lanes_decided = True
+                logger.info("merge state ids: %s",
+                            "device lanes" if lanes_mode else "arrow")
             try:
                 _t = time.perf_counter()
                 for bi in range(n_batches):
@@ -2060,6 +2148,8 @@ def _reduce(
         "tiebreak_source": "hit_tie" if want_tie else "hit_ids",
         "run_sha": run_sha,
         "merge_fold": sorted(_FOLD_USED),
+        # The decode width this reduce actually used.
+        "cpu_thread_count": pa.cpu_count(),
         "queries_short_of_k": short_count,
         # The phase split behind the `merge-bench` line, which used to live only
         # in the log. The writer adds this search's `elapsed_seconds` around it.

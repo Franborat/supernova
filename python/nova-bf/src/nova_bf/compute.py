@@ -4046,6 +4046,55 @@ def _select_device(torch) -> str:
     return want
 
 
+def configure_thread_pools(cfg, io_thread_count: int | None,
+                          cpu_thread_count: int | None) -> tuple[int, int]:
+    """Size pyarrow's IO and DECODE pools; return `(decode width, io width)`.
+
+    Both are returned because the run manifest records them. The decode width
+    is RESOLVED (0/unset becomes `_usable_cpu_count()`); the io width is the
+    setting as given, so a 0 there means "left at Arrow's default" -- which the
+    manifest reports as 0, not as the 8 the pool actually is.
+
+    MUST run before the first parquet read of the run, not just before the
+    corpus scan: the query loaders and `_sample_mean_doc_tokens` decode ahead of
+    it, and `_sample_mean_doc_tokens` pulls one whole multivector column. Those
+    used to run against whatever pool the environment left behind -- a single
+    thread under a GPU launcher's OMP_NUM_THREADS=1.
+
+    The decode pool is the one that silently costs a large share of read time:
+    pyarrow takes its default from OMP_NUM_THREADS, and a one-thread pool
+    throttles every reader thread at once while looking exactly like an IO
+    bottleneck. `_usable_cpu_count()` honours affinity and cgroup quota, so a
+    container gets its own share rather than the host's core count.
+    """
+    import pyarrow as pa
+
+    itc = io_thread_count if io_thread_count is not None else cfg.params.io_thread_count
+    if itc and itc > 0:
+        pa.set_io_thread_count(itc)
+        logger.info("pyarrow IO thread pool set to %d (true S3 fetch concurrency)", itc)
+    # The OTHER pyarrow pool: parquet DECODE parallelism
+    cpu_n = (cpu_thread_count if cpu_thread_count is not None
+             else cfg.params.cpu_thread_count)
+    if not cpu_n or cpu_n <= 0:
+        cpu_n = _usable_cpu_count()
+        machine = os.cpu_count() or 1
+        if cpu_n < machine:
+            logger.info(
+                "cpu_thread_count=0 resolved to %d, not the machine's %d — this "
+                "process is limited by CPU affinity and/or a cgroup quota. Set "
+                "params.cpu_thread_count to override.",
+                cpu_n, machine,
+            )
+    if pa.cpu_count() != cpu_n:
+        logger.info(
+            "pyarrow CPU thread pool %d -> %d (parquet decode parallelism)",
+            pa.cpu_count(), cpu_n,
+        )
+    pa.set_cpu_count(cpu_n)
+    return cpu_n, itc
+
+
 def run_compute(
     cfg: BruteForceConfig,
     num_jobs: int | None = None,
@@ -4088,6 +4137,20 @@ def run_compute(
     from nova_bf import topk_triton as _tt
     _mt.reset_usage()
     _tt.reset_usage()
+
+    # Size pools before any Parquet reads: query loading and token sampling run
+    # before the corpus scan and should not inherit a launcher's thread default.
+    cpu_n, itc = configure_thread_pools(cfg, io_thread_count, cpu_thread_count)
+
+    # Torch inherits OMP_NUM_THREADS like PyArrow. This mainly affects the
+    # host->pinned staging copy performed once per dense slice.
+    try:
+        # Set exactly, since `_usable_cpu_count()` may be cgroup-limited.
+        # Leaving Torch above it can oversubscribe and trigger CFS throttling.
+        if torch.get_num_threads() != cpu_n:
+            torch.set_num_threads(cpu_n)
+    except Exception as exc:                # noqa: BLE001 - never fail a run
+        logger.warning("could not set torch's thread count: %s", exc)
     job_rank = _resolve_rank(num_jobs, job_rank)
     specs = cfg.searches
     vts_needed = sorted({s.vector_type for s in specs})  # ["dense"] / ["sparse"] / both
@@ -4803,31 +4866,6 @@ def run_compute(
     # must not block a DIFFERENT spec's id resolution for that same file.
     corpus_ids: dict[int, object] = {}
     io_workers = max(1, io_workers if io_workers is not None else cfg.params.io_workers)
-    itc = io_thread_count if io_thread_count is not None else cfg.params.io_thread_count
-    if itc and itc > 0:
-        import pyarrow as pa
-        pa.set_io_thread_count(itc)
-        logger.info("pyarrow IO thread pool set to %d (true S3 fetch concurrency)", itc)
-    # The OTHER pyarrow pool: parquet DECODE parallelism
-    cpu_n = (cpu_thread_count if cpu_thread_count is not None
-             else cfg.params.cpu_thread_count)
-    if not cpu_n or cpu_n <= 0:
-        cpu_n = _usable_cpu_count()
-        machine = os.cpu_count() or 1
-        if cpu_n < machine:
-            logger.info(
-                "cpu_thread_count=0 resolved to %d, not the machine's %d — this "
-                "process is limited by CPU affinity and/or a cgroup quota. Set "
-                "params.cpu_thread_count to override.",
-                cpu_n, machine,
-            )
-    import pyarrow as pa
-    if pa.cpu_count() != cpu_n:
-        logger.info(
-            "pyarrow CPU thread pool %d -> %d (parquet decode parallelism)",
-            pa.cpu_count(), cpu_n,
-        )
-    pa.set_cpu_count(cpu_n)
 
     # One process-wide pool for CPU text tokenization. Its width follows
     # `cpu_thread_count`, while `io_workers` controls only files in flight.

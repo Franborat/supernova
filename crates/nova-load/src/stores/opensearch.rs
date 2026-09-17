@@ -37,7 +37,8 @@ use opensearch::indices::{
     IndicesGetSettingsParts, IndicesPutSettingsParts, IndicesRefreshParts, IndicesStatsParts,
 };
 use opensearch::{BulkOperation, BulkParts, ExistsParts, OpenSearch};
-use serde::Deserialize;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -975,6 +976,44 @@ fn check_u64_setting(
     Ok(())
 }
 
+/// One bulk document: the point's payload fields, plus its dense vectors.
+///
+/// The vectors are held as `Vec<f32>` and serialized straight into the request
+/// instead of being folded into the payload [`Value`] first, and that is the
+/// whole reason this type exists rather than a plain `Value::Object`.
+/// `serde_json::Number` is f64-backed, so an `f32` stored in a `Value` is
+/// re-emitted as the shortest form of the *promoted f64*: `0.1f32` goes out as
+/// `0.10000000149011612` where `0.1` round-trips to the identical f32. That is
+/// roughly twice the bytes for every component of every vector on every bulk
+/// request, plus the matching parse cost on the server — a self-inflicted
+/// handicap in a benchmarking tool, and a misleading one, since it makes the
+/// backend's wire cost look worse than JSON actually requires.
+///
+/// Serializing the slice directly reaches serde's `serialize_f32`, which keeps
+/// the f32 shortest form. Purely a size/cost fix: both spellings parse back to
+/// the same f32, so indexed vectors are unchanged.
+struct BulkDoc {
+    payload: serde_json::Map<String, Value>,
+    /// `(vector name, values)`, in `HashMap` iteration order — field order in
+    /// a JSON object is not significant to OpenSearch.
+    vectors: Vec<(String, Vec<f32>)>,
+}
+
+impl Serialize for BulkDoc {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.payload.len() + self.vectors.len()))?;
+        for (key, value) in &self.payload {
+            map.serialize_entry(key, value)?;
+        }
+        for (name, values) in &self.vectors {
+            // `values` is `&Vec<f32>`, so this reaches `serialize_f32` per
+            // component — see the type docs.
+            map.serialize_entry(name, values)?;
+        }
+        map.end()
+    }
+}
+
 #[async_trait]
 impl VectorStore for OpenSearchStore {
     async fn ensure_collection(&self, schema: &CollectionSchema) -> Result<(), StoreError> {
@@ -1027,19 +1066,16 @@ impl VectorStore for OpenSearchStore {
         if points.is_empty() {
             return Ok(());
         }
-        let mut ops: Vec<BulkOperation<Value>> = Vec::with_capacity(points.len());
+        let mut ops: Vec<BulkOperation<BulkDoc>> = Vec::with_capacity(points.len());
         for point in points {
             let id = match &point.id {
                 PointId::Integer(n) => n.to_string(),
                 PointId::String(s) => s.clone(),
             };
-            let mut doc = Value::Object(point.payload);
-            let obj = doc.as_object_mut().expect("payload is an object");
+            let mut vectors = Vec::with_capacity(point.vectors.len());
             for (name, value) in point.vectors {
                 match value {
-                    VectorValue::Dense(d) => {
-                        obj.insert(name, json!(d));
-                    }
+                    VectorValue::Dense(d) => vectors.push((name, d)),
                     // Guarded at the point of use, so no separate check can
                     // drift out of sync with what the mapping builder accepts.
                     VectorValue::Sparse { .. } | VectorValue::Multi(_) => {
@@ -1050,6 +1086,10 @@ impl VectorStore for OpenSearchStore {
                     }
                 }
             }
+            let doc = BulkDoc {
+                payload: point.payload,
+                vectors,
+            };
             ops.push(BulkOperation::index(doc).id(id).into());
         }
 
@@ -1668,4 +1708,31 @@ mod tests {
         assert!(!method_matches(&want, &live_lucene));
         assert!(!method_matches(&want, &Value::Null));
     }
+
+    /// Dense vectors must reach the bulk body as f32, not as promoted f64s.
+    ///
+    /// Folding them into the payload `Value` (what `json!` did) re-emits every
+    /// component as the shortest form of `f as f64` — ~2x the bytes per bulk
+    /// request and a longer parse server-side, for an identical indexed vector.
+    /// See `BulkDoc`.
+    #[test]
+    fn bulk_documents_serialize_vectors_as_f32_not_promoted_f64() {
+        let mut payload = serde_json::Map::new();
+        payload.insert("label".to_string(), json!("a"));
+        let doc = BulkDoc {
+            payload,
+            vectors: vec![("dense".to_string(), vec![0.1f32, 0.2, -0.3])],
+        };
+
+        let body = serde_json::to_string(&doc).expect("bulk doc serializes");
+        assert_eq!(body, r#"{"label":"a","dense":[0.1,0.2,-0.3]}"#);
+
+        // The premise, pinned: this is what the `json!`/`Value` route produced,
+        // and what a regression here would silently go back to.
+        assert_eq!(
+            json!(vec![0.1f32, 0.2, -0.3]).to_string(),
+            "[0.10000000149011612,0.20000000298023224,-0.30000001192092896]"
+        );
+    }
+
 }

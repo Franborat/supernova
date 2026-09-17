@@ -23,7 +23,8 @@ use opensearch::http::request::JsonBody;
 use opensearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use opensearch::indices::IndicesGetMappingParts;
 use opensearch::{MsearchParts, OpenSearch};
-use serde::Deserialize;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
 use url::Url;
 
@@ -313,6 +314,85 @@ fn fail(started: Instant, n: usize, error: String, timed_out: bool) -> BatchOutc
     }
 }
 
+/// One line of an `_msearch` body. The two kinds alternate (index header, then
+/// search body), so they share a `Vec` and therefore a type; `untagged` makes
+/// each serialize as nothing but its own object.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MsearchLine<'a> {
+    Header { index: &'a str },
+    Search(SearchBody<'a>),
+}
+
+/// `{"query": {"knn": {"<field>": {...}}}, "_source": ..., "size": k}`.
+///
+/// Typed rather than built with `json!`, and that is the whole reason this type
+/// exists: `serde_json::Number` is f64-backed, so an `f32` routed through a
+/// [`Value`] is re-emitted as the shortest form of the *promoted f64* —
+/// `0.1f32` goes out as `0.10000000149011612` where `0.1` round-trips to the
+/// identical f32. On a 768-dim query that is ~16 KB on the wire instead of
+/// ~9.5 KB, every query, plus the matching float-parse cost on the server.
+/// Inside the measured latency window that is a self-inflicted handicap, and a
+/// misleading one: it charges the backend for bytes JSON never required.
+///
+/// Serializing the slice directly reaches serde's `serialize_f32`, keeping the
+/// f32 shortest form. Both spellings parse back to the same f32, so results are
+/// unchanged — this is purely wire size and CPU.
+struct SearchBody<'a> {
+    field: &'a str,
+    knn: Knn<'a>,
+    source: &'a Value,
+    size: u64,
+}
+
+impl Serialize for SearchBody<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("query", &KnnQuery { body: self })?;
+        map.serialize_entry("_source", self.source)?;
+        map.serialize_entry("size", &self.size)?;
+        map.end()
+    }
+}
+
+/// `{"knn": {"<field>": {...}}}` — the dynamic field name is why these two
+/// wrappers are hand-written instead of derived.
+struct KnnQuery<'a, 'b> {
+    body: &'b SearchBody<'a>,
+}
+
+impl Serialize for KnnQuery<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("knn", &KnnField { body: self.body })?;
+        map.end()
+    }
+}
+
+struct KnnField<'a, 'b> {
+    body: &'b SearchBody<'a>,
+}
+
+impl Serialize for KnnField<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(self.body.field, &self.body.knn)?;
+        map.end()
+    }
+}
+
+/// The `knn` clause itself. `vector` is a borrowed `&[f32]` so it reaches
+/// `serialize_f32` — see [`SearchBody`].
+#[derive(Serialize)]
+struct Knn<'a> {
+    vector: &'a [f32],
+    k: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method_parameters: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rescore: Option<&'a Value>,
+}
+
 #[async_trait]
 impl QueryTarget for OpenSearchTarget {
     fn disable_score_collection(&self) {
@@ -392,7 +472,7 @@ impl QueryTarget for OpenSearchTarget {
         };
 
         // `_msearch` body: one header line + one knn search-body line per query.
-        let mut body: Vec<JsonBody<Value>> = Vec::with_capacity(queries.len() * 2);
+        let mut body: Vec<JsonBody<MsearchLine>> = Vec::with_capacity(queries.len() * 2);
         for q in queries {
             // Dense-only target: guarded at the point of use, so no separate
             // check can drift out of sync — a sparse query is a per-dispatch
@@ -405,22 +485,23 @@ impl QueryTarget for OpenSearchTarget {
                     false,
                 );
             };
-            body.push(json!({ "index": self.index_name }).into());
-            let mut knn = json!({
-                "vector": dense,
-                "k": self.top_k,
-            });
-            if let Some(params) = &self.method_parameters {
-                knn["method_parameters"] = params.clone();
-            }
-            if let Some(rescore) = &self.rescore {
-                knn["rescore"] = rescore.clone();
-            }
             body.push(
-                json!({
-                    "query": { "knn": { self.vector_field.as_str(): knn } },
-                    "_source": source,
-                    "size": self.top_k,
+                MsearchLine::Header {
+                    index: &self.index_name,
+                }
+                .into(),
+            );
+            body.push(
+                MsearchLine::Search(SearchBody {
+                    field: &self.vector_field,
+                    knn: Knn {
+                        vector: dense,
+                        k: self.top_k,
+                        method_parameters: self.method_parameters.as_ref(),
+                        rescore: self.rescore.as_ref(),
+                    },
+                    source: &source,
+                    size: self.top_k,
                 })
                 .into(),
             );
@@ -824,4 +905,86 @@ query:
         // the ids.
         assert!(target.collect_ids);
     }
+
+    /// The query vector must reach the wire as f32, not as a promoted f64.
+    ///
+    /// Routing it through `serde_json::Value` (what `json!` does) re-emits each
+    /// component as the shortest form of `f as f64`, which is ~2x the bytes and
+    /// a longer parse on the server for no gain — see `SearchBody`.
+    #[test]
+    fn the_query_vector_serializes_as_f32_not_a_promoted_f64() {
+        let vector: Vec<f32> = vec![0.1, 0.2, -0.3];
+        let source = json!(false);
+        let line = MsearchLine::Search(SearchBody {
+            field: "dense",
+            knn: Knn {
+                vector: &vector,
+                k: 10,
+                method_parameters: None,
+                rescore: None,
+            },
+            source: &source,
+            size: 10,
+        });
+        let body = serde_json::to_string(&line).expect("search body serializes");
+
+        assert!(
+            body.contains(r#""vector":[0.1,0.2,-0.3]"#),
+            "vector should keep its f32 shortest form: {body}"
+        );
+        // The premise, pinned: this is what the `json!`/`Value` route produced,
+        // and what a regression here would silently go back to.
+        assert_eq!(
+            json!(vector).to_string(),
+            "[0.10000000149011612,0.20000000298023224,-0.30000001192092896]"
+        );
+    }
+
+    /// The whole clause shape, so the retyping from `json!` to structs cannot
+    /// quietly change the request OpenSearch receives.
+    #[test]
+    fn msearch_lines_keep_their_shape() {
+        let vector: Vec<f32> = vec![0.5, 0.25];
+        let source = json!({ "excludes": ["dense"] });
+        let params = json!({ "ef_search": 128 });
+        let rescore = json!({ "oversample_factor": 2.0 });
+
+        let header = serde_json::to_string(&MsearchLine::Header { index: "fiqa" }).unwrap();
+        assert_eq!(header, r#"{"index":"fiqa"}"#);
+
+        let search = serde_json::to_string(&MsearchLine::Search(SearchBody {
+            field: "dense",
+            knn: Knn {
+                vector: &vector,
+                k: 10,
+                method_parameters: Some(&params),
+                rescore: Some(&rescore),
+            },
+            source: &source,
+            size: 10,
+        }))
+        .unwrap();
+        assert_eq!(
+            search,
+            r#"{"query":{"knn":{"dense":{"vector":[0.5,0.25],"k":10,"method_parameters":{"ef_search":128},"rescore":{"oversample_factor":2.0}}}},"_source":{"excludes":["dense"]},"size":10}"#
+        );
+
+        // Unset knobs are omitted entirely rather than sent as `null`, which
+        // OpenSearch would reject.
+        let bare = serde_json::to_string(&MsearchLine::Search(SearchBody {
+            field: "dense",
+            knn: Knn {
+                vector: &vector,
+                k: 10,
+                method_parameters: None,
+                rescore: None,
+            },
+            source: &source,
+            size: 10,
+        }))
+        .unwrap();
+        assert!(!bare.contains("method_parameters"), "{bare}");
+        assert!(!bare.contains("rescore"), "{bare}");
+    }
+
 }

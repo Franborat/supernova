@@ -41,10 +41,13 @@ load:
 	cargo install --path crates/nova-load $(if $(LOAD_FEATURES),--features $(LOAD_FEATURES))
 
 # `nova storm` — Rust binary, into ~/.cargo/bin.
-# Same feature story as `load`: the extra QUERY targets are off by default and
-# opted into the same way. (This knob used to be missing, so a `make storm`
-# install could never reach a non-qdrant target even though the code was there.)
+# Same knob as `load`: the extra QUERY targets are off by default and opted into
+# the same way. (It used to be missing entirely, so a `make storm` install could
+# never reach a non-qdrant target even though the code was there.)
 #   make storm STORM_FEATURES=elastic,opensearch,milvus
+# Unlike `load`, the released fleet binary ships only `opensearch` — storm's
+# elastic and milvus targets have never been built in CI, so they stay opt-in
+# until a change can verify them.
 STORM_FEATURES ?=
 storm:
 	cargo install --path crates/nova-storm $(if $(STORM_FEATURES),--features $(STORM_FEATURES))

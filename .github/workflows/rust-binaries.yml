@@ -57,15 +57,19 @@ jobs:
       - name: Build deps
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake protobuf-compiler
 
-      # Both binaries ship with every backend compiled in, so a fleet binary can
-      # target any of them (qdrant/elastic/opensearch/milvus); the features are
-      # off by default in local dev builds. nova-storm was previously built with
-      # NO features, which silently shipped a binary whose only usable
-      # `target.type` was qdrant — its elastic/milvus/opensearch targets exist in
-      # the source but were never compiled into a release.
+      # nova-load ships with all load backends so the fleet binary can target any
+      # of them (qdrant/elastic/opensearch/milvus); the features are off by
+      # default in local dev builds.
+      #
+      # nova-storm builds with `opensearch` only. It was previously built with NO
+      # features, which silently shipped a binary whose only usable `target.type`
+      # was qdrant — its elastic and milvus targets exist in the source but have
+      # never been compiled here. Turning those two on belongs in a change that
+      # can also verify and fix them; doing it here would put an unrelated
+      # backend's compile errors in front of an opensearch release.
       - name: Build (release)
         run: |
-          cargo build --release -p nova-storm --features elastic,opensearch,milvus
+          cargo build --release -p nova-storm --features opensearch
           cargo build --release -p nova-load  --features elastic,opensearch,milvus
 
       - name: Stage assets as <bin>-<target>
